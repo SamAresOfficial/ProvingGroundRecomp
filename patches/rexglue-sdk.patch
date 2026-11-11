@@ -549,7 +549,7 @@ index d26cd4f..0923e3e 100644
  
  }  // namespace rex::graphics
 diff --git a/include/rex/graphics/primitive_processor.h b/include/rex/graphics/primitive_processor.h
-index 2945731..623540f 100644
+index 2945731..b1696f2 100644
 --- a/include/rex/graphics/primitive_processor.h
 +++ b/include/rex/graphics/primitive_processor.h
 @@ -20,6 +20,7 @@
@@ -576,7 +576,7 @@ index 2945731..623540f 100644
    enum ProcessedIndexBufferType {
      // Auto-indexed on the host.
      kNone,
-@@ -296,6 +306,26 @@ class PrimitiveProcessor {
+@@ -296,6 +306,29 @@ class PrimitiveProcessor {
    virtual void* RequestHostConvertedIndexBufferForCurrentFrame(
        xenos::IndexFormat format, uint32_t index_count, bool coalign_for_simd,
        uint32_t coalignment_original_address, size_t& backend_handle_out) = 0;
@@ -590,6 +590,9 @@ index 2945731..623540f 100644
 +    return nullptr;
 +  }
 +  virtual size_t UsePersistentConvertedIndexBuffer(size_t persistent_handle) { return SIZE_MAX; }
++  // Whether persistent space is nearly used up, so the space of forgotten entries should be
++  // released before it runs out (it is reusable only a submission later).
++  virtual bool IsPersistentConvertedIndexBufferSpaceLow() const { return false; }
 +  // The entry owning the persistent buffer was replaced or dropped. The backend reuses the
 +  // space once the last submission that may have drawn from it (at the latest, the current
 +  // one) has completed, and then increments persistent_index_buffer_frees_.
@@ -603,7 +606,7 @@ index 2945731..623540f 100644
  
   private:
  #if XE_GPU_PRIMITIVE_PROCESSOR_SIMD_SIZE
-@@ -751,6 +781,45 @@ class PrimitiveProcessor {
+@@ -751,6 +784,48 @@ class PrimitiveProcessor {
    // If an entry was found in the cache (GetFoundResult results non-null), it
    // MUST be used instead of processing - this class doesn't provide the
    // possibility replace existing entries.
@@ -634,9 +637,12 @@ index 2945731..623540f 100644
 +  };
 +  void ReleaseStaticIndexEntryBuffers(StaticIndexEntry& entry);
 +  // Drops entries whose range is no longer registered and that weren't drawn for a while,
-+  // releasing their persistent buffers. Under pressure (a persistent buffer could not be had),
-+  // drops every entry whose range is gone at once.
++  // releasing their persistent buffers. Under pressure (persistent space is low or ran out),
++  // drops every entry whose range is gone, whenever it was drawn. Released space becomes
++  // reusable only once the current submission has completed.
 +  void TrimStaticIndexEntries(bool under_pressure);
++  // TrimStaticIndexEntries(true) if it may release anything and hasn't run this frame.
++  void MaybeTrimStaticIndexEntriesUnderPressure();
 +  // By base << 32 | index count.
 +  std::unordered_map<uint64_t, StaticIndexEntry> static_index_entries_;
 +  uint32_t static_index_frame_ = 0;
@@ -1779,7 +1785,7 @@ index 7b938b9..1128295 100644
        Reset();
      }
 diff --git a/include/rex/graphics/vulkan/primitive_processor.h b/include/rex/graphics/vulkan/primitive_processor.h
-index 35d58d3..8eab0b4 100644
+index 35d58d3..595e49f 100644
 --- a/include/rex/graphics/vulkan/primitive_processor.h
 +++ b/include/rex/graphics/vulkan/primitive_processor.h
 @@ -10,8 +10,13 @@
@@ -1851,7 +1857,7 @@ index 35d58d3..8eab0b4 100644
  class VulkanPrimitiveProcessor final : public PrimitiveProcessor {
   public:
    VulkanPrimitiveProcessor(const RegisterFile& register_file, memory::Memory& memory,
-@@ -56,6 +109,11 @@ class VulkanPrimitiveProcessor final : public PrimitiveProcessor {
+@@ -56,6 +109,12 @@ class VulkanPrimitiveProcessor final : public PrimitiveProcessor {
                                                         uint32_t index_count, bool coalign_for_simd,
                                                         uint32_t coalignment_original_address,
                                                         size_t& backend_handle_out) override;
@@ -1859,11 +1865,12 @@ index 35d58d3..8eab0b4 100644
 +                                              uint32_t coalignment_original_address,
 +                                              size_t& persistent_handle_out) override;
 +  size_t UsePersistentConvertedIndexBuffer(size_t persistent_handle) override;
++  bool IsPersistentConvertedIndexBufferSpaceLow() const override;
 +  void ReleasePersistentConvertedIndexBuffer(size_t persistent_handle) override;
  
   private:
    VulkanCommandProcessor& command_processor_;
-@@ -75,6 +133,55 @@ class VulkanPrimitiveProcessor final : public PrimitiveProcessor {
+@@ -75,6 +134,57 @@ class VulkanPrimitiveProcessor final : public PrimitiveProcessor {
    std::unique_ptr<ui::vulkan::VulkanUploadBufferPool> frame_index_buffer_pool_;
    // Indexed by the backend handles.
    std::deque<std::pair<VkBuffer, VkDeviceSize>> frame_index_buffers_;
@@ -1910,6 +1917,8 @@ index 35d58d3..8eab0b4 100644
 +  // Device-local host-visible memory types in large enough heaps.
 +  uint32_t persistent_index_direct_memory_types_ = 0;
 +  bool persistent_index_budget_warned_ = false;
++  // Allocated (including released but not yet freed) bytes in all chunks.
++  uint64_t persistent_index_used_bytes_ = 0;
 +  std::unique_ptr<ui::vulkan::VulkanUploadBufferPool> persistent_index_staging_pool_;
 +  uint64_t persistent_index_staging_last_submission_ = 0;
 +  uint32_t persistent_index_staging_idle_frames_ = UINT32_MAX;
@@ -4906,7 +4915,7 @@ index 76f5600..b34dd88 100644
          scaled_resolve_pages_l2_[i] &= ~(UINT64_C(1) << resolve_block_relative_index);
        }
 diff --git a/src/graphics/primitive_processor.cpp b/src/graphics/primitive_processor.cpp
-index d49e9c3..f708c3e 100644
+index d49e9c3..a7912c0 100644
 --- a/src/graphics/primitive_processor.cpp
 +++ b/src/graphics/primitive_processor.cpp
 @@ -15,14 +15,17 @@
@@ -5005,7 +5014,7 @@ index d49e9c3..f708c3e 100644
        REXGPU_ERROR(
            "PrimitiveProcessor: Failed to request index buffer 0x{:08X}, 0x{:X} "
            "bytes needed, in the shared memory",
-@@ -976,6 +1000,201 @@ bool PrimitiveProcessor::IsResetUsed(const uint16_t* source, uint32_t count,
+@@ -976,6 +1000,209 @@ bool PrimitiveProcessor::IsResetUsed(const uint16_t* source, uint32_t count,
    return false;
  }
  
@@ -5085,19 +5094,6 @@ index d49e9c3..f708c3e 100644
 +      if (entry.persistent_handle == SIZE_MAX) {
 +        void* host_indices = RequestPersistentConvertedIndexBuffer(
 +            entry.result.host_index_format, count, base, entry.persistent_handle);
-+        if (!host_indices &&
-+            static_index_last_pressure_trim_frame_ != static_index_frame_) {
-+          // Out of space: make room from entries whose range is gone, and try once more. The
-+          // trim may erase the old entry of this key, which is replaced anyway (its buffers
-+          // were released or moved to the new entry above).
-+          if (it != static_index_entries_.end()) {
-+            static_index_entries_.erase(it);
-+            it = static_index_entries_.end();
-+          }
-+          TrimStaticIndexEntries(true);
-+          host_indices = RequestPersistentConvertedIndexBuffer(
-+              entry.result.host_index_format, count, base, entry.persistent_handle);
-+        }
 +        if (!host_indices) {
 +          // Remembered, so the indices are not scanned again on every draw (the draw is
 +          // converted the usual way, per frame) until the range changes or space is freed.
@@ -5105,6 +5101,11 @@ index d49e9c3..f708c3e 100644
 +          entry.failed = true;
 +          entry.failed_frees = persistent_index_buffer_frees_;
 +          static_index_entries_.insert_or_assign(key, std::move(entry));
++          // Out of space: release the entries whose range is gone. Their space can't be reused
++          // before the current submission completes (native mesh draws may still read it), so
++          // this conversion is tried again once the backend has freed it. The trim keeps the
++          // new entry, as its range is registered.
++          MaybeTrimStaticIndexEntriesUnderPressure();
 +          return false;
 +        }
 +        if (is_ffff_used_as_vertex_index) {
@@ -5123,6 +5124,11 @@ index d49e9c3..f708c3e 100644
 +      memory_.EnablePhysicalMemoryAccessCallbacks(base, bytes, true, false);
 +    }
 +    it = static_index_entries_.insert_or_assign(key, std::move(entry)).first;
++    if (IsPersistentConvertedIndexBufferSpaceLow()) {
++      // Release forgotten entries ahead of time, so their space has been freed by the time it
++      // runs out. The trim keeps this entry, as its range is registered.
++      MaybeTrimStaticIndexEntriesUnderPressure();
++    }
 +  }
 +  if (it->second.failed) {
 +    return false;
@@ -5155,6 +5161,17 @@ index d49e9c3..f708c3e 100644
 +      static_index_trim_removal_version_ != native_ranges::RemovalVersion()) {
 +    TrimStaticIndexEntries(false);
 +  }
++}
++
++void PrimitiveProcessor::MaybeTrimStaticIndexEntriesUnderPressure() {
++  // At most once a frame, and only if a range may have been forgotten since the last trim, or
++  // the last trim kept forgotten entries; otherwise there is nothing more to release.
++  if (static_index_last_pressure_trim_frame_ == static_index_frame_ ||
++      (!static_index_trim_pending_ &&
++       static_index_trim_removal_version_ == native_ranges::RemovalVersion())) {
++    return;
++  }
++  TrimStaticIndexEntries(true);
 +}
 +
 +void PrimitiveProcessor::TrimStaticIndexEntries(bool under_pressure) {
@@ -12219,7 +12236,7 @@ index 91ac08f..5c2d2f7 100644
      if (edram_fragment_shader_interlock) {
        shader_stage_fragment.module = depth_only_fragment_shader_;
 diff --git a/src/graphics/vulkan/primitive_processor.cpp b/src/graphics/vulkan/primitive_processor.cpp
-index cdbedae..1de9995 100644
+index cdbedae..c91029e 100644
 --- a/src/graphics/vulkan/primitive_processor.cpp
 +++ b/src/graphics/vulkan/primitive_processor.cpp
 @@ -34,6 +34,14 @@ REXCVAR_DEFINE_BOOL(vulkan_force_convert_quad_lists_to_triangle_lists, false, "G
@@ -12270,7 +12287,7 @@ index cdbedae..1de9995 100644
    return true;
  }
  
-@@ -83,6 +117,15 @@ void VulkanPrimitiveProcessor::Shutdown(bool from_destructor) {
+@@ -83,6 +117,16 @@ void VulkanPrimitiveProcessor::Shutdown(bool from_destructor) {
  
    frame_index_buffers_.clear();
    frame_index_buffer_pool_.reset();
@@ -12282,11 +12299,12 @@ index cdbedae..1de9995 100644
 +  persistent_index_slots_.clear();
 +  persistent_index_slots_free_.clear();
 +  persistent_index_slots_released_.clear();
++  persistent_index_used_bytes_ = 0;
 +  persistent_index_staging_pool_.reset();
    ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device, builtin_index_buffer_upload_);
    ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device,
                                           builtin_index_buffer_upload_memory_);
-@@ -95,6 +138,20 @@ void VulkanPrimitiveProcessor::Shutdown(bool from_destructor) {
+@@ -95,6 +139,20 @@ void VulkanPrimitiveProcessor::Shutdown(bool from_destructor) {
  }
  
  void VulkanPrimitiveProcessor::CompletedSubmissionUpdated() {
@@ -12307,7 +12325,7 @@ index cdbedae..1de9995 100644
    if (builtin_index_buffer_upload_ != VK_NULL_HANDLE &&
        command_processor_.GetCompletedSubmission() >= builtin_index_buffer_upload_submission_) {
      const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
-@@ -134,15 +191,93 @@ void VulkanPrimitiveProcessor::BeginSubmission() {
+@@ -134,15 +192,93 @@ void VulkanPrimitiveProcessor::BeginSubmission() {
  
  void VulkanPrimitiveProcessor::BeginFrame() {
    frame_index_buffer_pool_->Reclaim(command_processor_.GetCompletedFrame());
@@ -12401,7 +12419,7 @@ index cdbedae..1de9995 100644
  }
  
  bool VulkanPrimitiveProcessor::InitializeBuiltinIndexBuffer(
-@@ -231,4 +366,232 @@ void* VulkanPrimitiveProcessor::RequestHostConvertedIndexBufferForCurrentFrame(
+@@ -231,4 +367,243 @@ void* VulkanPrimitiveProcessor::RequestHostConvertedIndexBufferForCurrentFrame(
    return mapping;
  }
  
@@ -12594,6 +12612,7 @@ index cdbedae..1de9995 100644
 +  slot.chunk = chunk_index;
 +  slot.allocation_offset = VkDeviceSize(allocation_offset);
 +  slot.allocation_size = allocation_size;
++  persistent_index_used_bytes_ += allocation_size;
 +  slot.buffer_offset = buffer_offset;
 +  slot.last_use_submission = submission_current;
 +  persistent_handle_out = persistent_handle;
@@ -12610,6 +12629,15 @@ index cdbedae..1de9995 100644
 +  frame_index_buffers_.emplace_back(persistent_index_chunks_[slot.chunk].buffer,
 +                                    slot.buffer_offset);
 +  return handle;
++}
++
++bool VulkanPrimitiveProcessor::IsPersistentConvertedIndexBufferSpaceLow() const {
++  // 90% of the budget, rounded up to whole chunks as in RequestPersistentConvertedIndexBuffer.
++  const uint64_t budget_bytes = uint64_t(REXCVAR_GET(vulkan_static_index_buffer_budget_mb))
++                                << 20;
++  const uint64_t capacity = (budget_bytes + kPersistentIndexChunkSize - 1) /
++                            kPersistentIndexChunkSize * kPersistentIndexChunkSize;
++  return capacity && persistent_index_used_bytes_ * 10 >= capacity * 9;
 +}
 +
 +void VulkanPrimitiveProcessor::ReleasePersistentConvertedIndexBuffer(size_t persistent_handle) {
@@ -12629,6 +12657,7 @@ index cdbedae..1de9995 100644
 +void VulkanPrimitiveProcessor::FreePersistentIndexSlot(size_t persistent_handle) {
 +  const PersistentIndexSlot& slot = persistent_index_slots_[persistent_handle];
 +  persistent_index_chunks_[slot.chunk].ranges.Free(slot.allocation_offset, slot.allocation_size);
++  persistent_index_used_bytes_ -= slot.allocation_size;
 +  persistent_index_slots_free_.push_back(persistent_handle);
 +  ++persistent_index_buffer_frees_;
 +}

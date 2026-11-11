@@ -274,7 +274,8 @@ Otherwise each conversion is written to a staging buffer, and the copy is record
 submission-start command buffer, before every draw of that submission, with a barrier to
 index reads. Each chunk has a first-fit free list. A conversion is released when its entry
 is replaced by different contents, or when its range has been forgotten and not drawn for
-300 frames (at once when space runs out). Its space is reused after the submission that
+300 frames. Once 90% of the budget is used, or when it runs out, forgotten entries are
+released right away, whenever they were last drawn. Their space is reused after the submission that
 released it completes, which also covers native mesh draws (step 9) that bind the buffer
 without going through the primitive processor. Entries whose range is still registered are
 never evicted, for the same reason. When the budget is full, new meshes are converted every
