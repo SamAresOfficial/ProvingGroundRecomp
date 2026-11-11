@@ -1151,6 +1151,52 @@ twin; memory written only into the own-scale texture is stale for the CPU, as wi
 direct resolves (a load from memory over the range blocks the address). Next (step 4): fewer
 render pass breaks (~40 a frame).
 
+### Direct resolves: lazy write-back to shared memory (2026-11-11)
+
+Before, a direct resolve (`gpu_resolve_direct_texture`, also at the target's own scale) marked
+its pages valid and GPU-written in shared memory although only the texture image was written.
+Anything else reading the range (another texture key over the memory, the unscaled fallback of
+an own-scale texture, vertex fetch, memexport, a resolve readback) got the bytes from before,
+and a texture load over the range blocked the address for good ("resolving it the usual way").
+Now the data is given to shared memory when it is first needed, and the address stays direct:
+
+- `VulkanTextureCache` tracks each direct-resolved range with the texture holding it
+  (`direct_resolve_ranges_`: extent, base, texture, the resolve rectangle).
+- `SharedMemory` has "deferred GPU writes" (`SetDeferredGpuWriteRanges`): one bit per page
+  with such data and the bounds of the set bits. `RequestRanges` checks the bounds (two
+  compares per range in the usual case), then the bits, and calls the texture cache before it
+  hands the pages out. Everything that reads shared memory requests it first, so this covers
+  texture loads, vertex and index buffers, memexport and the destination of a usual resolve.
+  The widening of uploads skips pages with deferred data.
+- The write-back (`WriteBackDirectResolve`): the image is copied into the scratch buffer, then
+  a compute pass (GLSL compiled at first use) writes guest memory: tiled addresses, the
+  texture's endianness, 8888 words, or the depth word from the float32 the texture holds
+  (float24 for k_24_8_FLOAT, unorm24 for k_24_8; the stencil byte is 0). A texture at its own
+  scale is brought to guest size like the copy into the unscaled twin (linear for color,
+  nearest for depth). With a draw resolution scale the destination is the scaled resolve
+  buffer in its layout, asked for by texture loads and resolves instead of by shared memory.
+  The texture stays current, and the range is an ordinary resolved range afterwards.
+- A CPU write to a page of the range outdates the texture as before. The tracking stays until
+  the next reader: the image is written back first, then the CPU's pages are uploaded over it
+  (kept in order in the submission, `PrepareDeferredGpuWrite`), so a partial CPU write is
+  right too.
+- A resolve of the same range replaces the tracked data without a write-back. A range not
+  resolved into for 600 frames is written back at the next direct resolve, so its texture can
+  be dropped; until then the texture is kept alive.
+- `vulkan_readback_resolve`: a direct resolve is written back at once and read back like a
+  usual one.
+- Safety net only: if a write-back cannot be done (no scratch buffer or descriptor), the range
+  is invalidated in shared memory (the CPU's copy is used), a warning is logged and the
+  address is resolved the usual way from then on. The same invalidation, with a warning,
+  happens if the texture is destroyed while tracked. Without the write-back pipeline no
+  resolve is done directly.
+
+No new cvars. In the common case (only the texture itself samples the range) nothing is
+written back: per direct resolve there is one more `RequestRange` of pages that are already
+valid. With `--vulkan_gpu_timing` sequence logging, each write-back is listed as
+"direct resolve ... written back to memory". Not verified in-game yet (written without a
+build): see the test steps in the change's report.
+
 ### Native EDRAM step 4 and the rest of step 2 (2026-11-07)
 
 **Texture loads before the render pass** (`--native_hoist_texture_loads`, GPU/Native, default
