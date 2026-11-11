@@ -51,6 +51,44 @@ retire swaps quickly; at a real 60 Hz the game drops to 30 FPS every few seconds
 each swap. 30 restores the original vsync pacing. `--uncapped_real_time=false` disables the
 fixes.
 
+Note that the `vsync` cvar (set by `ApplyFrameRateLimit`: on only at 30) is the SDK's guest
+vblank timer, 60 Hz or 1 kHz. It has nothing to do with how the host presents.
+
+### Presenting in step with the display (`present_sync`)
+
+The presenters used to present without vsync only (Vulkan IMMEDIATE, D3D12
+`Present(0, ALLOW_TEARING)`), so even limits that divide the refresh rate tore and beat against
+the scan-out (a 60 FPS timer on a 59.94 Hz panel slips a frame every 17 s). `present_sync`
+(`auto` by default, `on`, `off`; launcher and Insert menu: Vsync) chooses per frame:
+
+- `auto`: synced when `frame_rate_limit` equals or divides the display's refresh rate within 1%,
+  at most 4 vblanks per frame (30/40/60/120 at 120 Hz, 30/60 at 60 Hz); otherwise, and with the
+  limit at 0, unsynced as before, for VRR. `on`: always synced (a limit that doesn't divide the
+  refresh rate gets plain vsync and keeps the timer). `off`: never.
+- The refresh rate comes from the monitor the window is on: `EnumDisplaySettingsW` refined by
+  the closest DXGI mode on Windows (59.94, not 59), the SDL display mode elsewhere. It is
+  re-read when the window changes monitor and on SDL display mode events, and logged
+  (`Presenter: display refresh rate ...`).
+- D3D12: the swap chain is created with `FRAME_LATENCY_WAITABLE_OBJECT` (and tearing where
+  supported) and is never recreated for this. Synced, `Present(refresh / limit, 0)` with a
+  maximum frame latency of 1, waiting on the waitable object before painting; unsynced as
+  before, with a latency of 3 (the old default).
+- Vulkan: the present mode is fixed at swapchain creation, so a change (the setting, the limit
+  or the display) makes `PaintAndPresentImpl` report the connection as outdated, and the UI
+  thread recreates the swapchain on the existing reconnect path. Synced uses FIFO, painted from
+  the GPU thread (not the UI thread, as FIFO normally is) so the present's wait holds the GPU
+  thread and, through the swap, the game. FIFO can't show a frame for several vblanks, so with
+  `VK_KHR_present_wait` the presenter waits for the previous frame to reach the screen (one frame
+  queued at most), takes that as the vblank, and queues the next frame just after the vblank
+  before the one it's due on. Without present wait, FIFO paces 1 vblank per frame by itself, and
+  for more the game's timer runs at whole refreshes of the measured rate.
+- FSR 3 frame generation keeps choosing its own present mode (FIFO with
+  `fsr3_frame_generation_vsync`); `present_sync` doesn't apply while it is on.
+- The presenter reports how it paces (`rex::ui::present_sync::GetPacing`) after each present
+  from the GPU thread. When it holds frames on the vblanks, `LimitFrameRate` steps aside instead
+  of waiting a second time; the report lapses after 100 ms without presents (minimized), or
+  while the UI thread paints (Insert menu), and the timer takes over.
+
 ### Cutscene camera clock
 
 The cutscene cameras only see whole vblanks, so their poses change at most 60 times a second.
@@ -109,8 +147,8 @@ generated code (and the xex), which the fix above was made without:
 Every setting is a cvar: it can go in `pg.toml` next to the executable or on the command line
 (`--name=value`). The launcher and the Insert menu write `game_data_root`,
 `renderer`, `render_resolution`, `upscaler`, `d3d12_fsr_version`, `sharpness`, `fullscreen`, `frame_rate_limit`,
-`swap_post_effect`, `button_prompts`, `show_fps` and `show_launcher`, and keep any other lines
-in the file.
+`present_sync`, `swap_post_effect`, `button_prompts`, `show_fps` and `show_launcher`, and keep
+any other lines in the file.
 
 | Flag | |
 | --- | --- |

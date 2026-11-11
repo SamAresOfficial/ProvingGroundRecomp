@@ -9,8 +9,9 @@ namespace pg {
 // Frames the game presented per second, averaged over the last half second; 0 before the first.
 double PresentedFps();
 
-// Applies the frame_rate_limit setting: 30 restores the game's own vsync pacing, any other value
-// runs the game uncapped and, unless it is 0, holds it at that many frames per second.
+// Applies the frame_rate_limit and present_sync settings: 30 restores the game's own vsync
+// pacing, any other value runs the game uncapped and, unless it is 0, holds it at that many
+// frames per second; present_sync tells the presenter when to present with vsync.
 void ApplyFrameRateLimit();
 
 // The engine's game time in milliseconds: the sum of its frame times over the main loop's frames.

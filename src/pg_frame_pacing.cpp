@@ -28,6 +28,7 @@
 #include <rex/cvar.h>
 #include <rex/perf/counter.h>
 #include <rex/ppc.h>
+#include <rex/ui/present_sync.h>
 
 #if REX_PLATFORM_WIN32
 #include <windows.h>
@@ -44,12 +45,20 @@ REXCVAR_DEFINE_BOOL(uncapped_real_time, true, "GPU",
                     "counter at the real 60 Hz so cutscenes run at the right speed")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_INT32(frame_rate_limit, 60, "Video",
-                     "Frame rate limit, held by a timer: 30 is the console's rate (paced by "
-                     "60 Hz guest vblanks), 0 is unlimited. Frames are presented without "
-                     "vsync, so use a variable refresh rate display to avoid tearing")
-    // 40 and 90 are whole fractions of 120 Hz screens (handhelds such as the ROG Xbox Ally);
-    // the timer is not locked to the display's scan-out, so without VRR they still tear.
+                     "Frame rate limit: 30 is the console's rate (paced by 60 Hz guest "
+                     "vblanks), 0 is unlimited. With present_sync=auto, a limit that equals or "
+                     "divides the display's refresh rate is presented with vsync and paced on "
+                     "its vblanks; others are held by a timer and presented without vsync")
+    // 40 and 90 divide 120 Hz screens (handhelds such as the ROG Xbox Ally) evenly, so with
+    // present_sync they are shown for exactly 3 and 4 refreshes without VRR; 30 and 60 divide 60,
+    // 120 and 240 Hz screens.
     .allowed({"0", "30", "40", "60", "90", "120", "144", "165", "240"});
+REXCVAR_DEFINE_STRING(present_sync, "auto", "Video",
+                      "Present with vsync: auto when the frame rate limit equals or divides the "
+                      "display's refresh rate (no tearing, even frame times), otherwise without "
+                      "(for variable refresh rate); on always; off never")
+    .allowed({"auto", "on", "off"})
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(swap_waits_for_new_frame, true, "Video",
                     "After a swap, the render thread waits for the game's next frame instead of "
                     "presenting the last one again")
@@ -159,7 +168,27 @@ void LimitFrameRate() {
     next = {};
     return;
   }
-  const auto period = std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(1.0 / limit));
+  // With presentation synced to the display (present_sync), the presenter may hold each frame
+  // for whole vblanks itself: its present blocks the GPU thread until the frame's vblank, and
+  // the game's swap waits for the GPU thread. A timer at 1 / limit as well would beat against
+  // the real refresh rate (59.94 Hz is not 60) and make the presenter miss vblanks, so it steps
+  // aside. Where the presenter can't hold a frame for several vblanks (Vulkan without present
+  // wait), the timer runs at whole refreshes of the measured rate instead of 1 / limit, so the
+  // frames don't drift against the scan-out. The presenter's report lapses when it stops
+  // presenting (minimized, or the Insert menu painting on the UI thread), and the timer takes
+  // over again.
+  double display_period = 0.0;
+  const rex::ui::present_sync::Pacing pacing = rex::ui::present_sync::GetPacing(&display_period);
+  if (pacing == rex::ui::present_sync::Pacing::kPresenter) {
+    next = {};
+    return;
+  }
+  const double period_seconds =
+      pacing == rex::ui::present_sync::Pacing::kAppAtDisplayPeriod && display_period > 0.0
+          ? display_period
+          : 1.0 / limit;
+  const auto period =
+      std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(period_seconds));
   const auto now = Clock::now();
   // A frame that took longer than the period ends at once, and the schedule restarts from it:
   // neither waiting a whole period after it (above 60 FPS a 20 ms frame was followed by a 7 ms
@@ -258,11 +287,16 @@ void SetPacingTraceActive(bool active) {
 double PresentedFps() { return presented_fps.load(std::memory_order_relaxed); }
 
 void ApplyFrameRateLimit() {
-  const bool vsync = REXCVAR_GET(frame_rate_limit) == 30;
+  const int32_t limit = REXCVAR_GET(frame_rate_limit);
+  const bool vsync = limit == 30;
   if (rex::cvar::Query<bool>("vsync") != vsync) {
     rex::cvar::SetFlagByName("vsync", vsync ? "true" : "false");
   }
   RefreshVsync();
+  // The presenters read these on every present, and recreate the swapchain when the present
+  // mode they call for changes.
+  rex::ui::present_sync::SetTargetFrameRate(uint32_t(std::max(limit, 0)));
+  rex::ui::present_sync::SetMode(rex::ui::present_sync::ParseMode(REXCVAR_GET(present_sync)));
 }
 
 }  // namespace pg

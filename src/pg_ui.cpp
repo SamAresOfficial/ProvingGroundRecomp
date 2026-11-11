@@ -75,11 +75,11 @@ constexpr uintmax_t kExpectedXexSize = 10366976;
 constexpr uint64_t kExpectedXexHash = 0xa02344935b47f717ull;
 
 // Settings written to the config file, in this order.
-constexpr std::array<const char*, 16> kSavedSettings = {
+constexpr std::array<const char*, 17> kSavedSettings = {
     "game_data_root",    "renderer",         "render_resolution", "effects_resolution", "upscaler",
     "d3d12_fsr_version", "sharpness",        "anisotropic_override", "fullscreen",
-    "monitor",           "frame_rate_limit", "swap_post_effect",  "button_prompts",
-    "language",          "show_fps",         "show_launcher",
+    "monitor",           "frame_rate_limit", "present_sync",      "swap_post_effect",
+    "button_prompts",    "language",         "show_fps",          "show_launcher",
 };
 
 std::function<rex::ui::Presenter*()> g_presenter_source;
@@ -953,8 +953,22 @@ bool EffectsResolutionSetting() {
 }
 
 constexpr const char* kFrameRateHelp =
-    "30 FPS keeps the original console pacing with vsync. Higher limits run the game uncapped "
-    "up to that rate; cutscenes keep their original speed.";
+    "30 FPS keeps the original console pacing. Higher limits run the game uncapped up to that "
+    "rate; cutscenes keep their original speed. With Vsync on Automatic, a rate that your "
+    "screen's refresh rate is a multiple of (30, 40, 60 on a 120 Hz screen) is shown in step "
+    "with the screen.";
+const std::vector<Choice> kPresentSync = {
+    {"auto", "Automatic"},
+    {"on", "On"},
+    {"off", "Off"},
+};
+constexpr const char* kPresentSyncHelp =
+    "Automatic shows each frame in step with your screen when the frame rate divides its "
+    "refresh rate evenly (30 or 60 FPS on a 60 Hz screen; 30, 40, 60 or 120 on 120 Hz): no "
+    "tearing and even frame times. Other rates, and Unlimited, are shown at once, which suits "
+    "variable refresh rate (FreeSync, G-SYNC) screens. On always waits for the screen (no "
+    "tearing, but uneven frame times when the rate doesn't divide the refresh rate). Off never "
+    "waits.";
 constexpr const char* kAntiAliasingHelp =
     "FXAA smooths edges in each frame. AMD FSR AA smooths them and also takes the internal "
     "resolution to your screen: FSR 3.1 with Vulkan, FSR 4 with Direct3D 12 (the newest FSR your "
@@ -1087,6 +1101,10 @@ bool GraphicsSettings(bool in_game) {
   bool changed = false;
   changed |= DisplayModeSetting();
   if (ComboSetting("Frame rate", "frame_rate_limit", kFrameRates, kFrameRateHelp)) {
+    ApplyFrameRateLimit();
+    changed = true;
+  }
+  if (ComboSetting("Vsync", "present_sync", kPresentSync, kPresentSyncHelp)) {
     ApplyFrameRateLimit();
     changed = true;
   }
@@ -1367,6 +1385,7 @@ void LauncherSettingsPage(LauncherState& state) {
     ComboSetting("Monitor", "monitor", choices, "The monitor the game opens on.");
   }
   ComboSetting("Frame rate", "frame_rate_limit", kFrameRates, kFrameRateHelp);
+  ComboSetting("Vsync", "present_sync", kPresentSync, kPresentSyncHelp);
   ToggleSetting("Show FPS counter", "show_fps", nullptr);
   EndCard();
 

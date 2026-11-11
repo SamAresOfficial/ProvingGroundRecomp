@@ -39,7 +39,8 @@ Not tested on a handheld yet. What to expect on a ROG Xbox Ally / Ally X:
   options menu. Move with the D-pad or left stick, change a setting with A, close a list with
   B, and press Menu (Start) or choose Resume to return to the game. While the menu is open the game doesn't see the controller.
 - Suggested settings for the 1080p 120 Hz screen: Resolution 1920 x 1080 or 1280 x 720, Effects
-  and HUD 1x, Sharpness about 50%, and a frame rate of 40 or 60 FPS (both divide 120 Hz evenly).
+  and HUD 1x, Sharpness about 50%, and a frame rate of 40 or 60 FPS (both divide 120 Hz evenly,
+  so with Vsync on Automatic each frame is shown for exactly 3 or 2 refreshes, without tearing).
   Effects and HUD on Automatic picks 2x at 1080p, which renders them at 1440p and costs GPU time
   the small screen can't show.
 - FSR 3/4 are turned off in this version (see below), so nothing here depends on FSR 4, which
@@ -53,6 +54,7 @@ Not tested on a handheld yet. What to expect on a ROG Xbox Ally / Ally X:
 | Display mode | Fullscreen or windowed. **F11** switches while playing. |
 | Monitor | With more than one monitor: the one the game opens on. |
 | Frame rate | 30 FPS keeps the original console pacing. 60 and above run the game faster than the console could; cutscenes still play at their original speed. |
+| Vsync | Automatic (default): when the frame rate divides your screen's refresh rate evenly (30 or 60 FPS at 60 Hz; 30, 40, 60 or 120 at 120 Hz; 144 at 144 Hz), each frame waits for the screen, so there is no tearing and every frame is shown for the same time. Other rates and Unlimited are shown at once, for FreeSync / G-SYNC screens. On always waits for the screen; Off never does. Applies at once. |
 | Renderer | Vulkan (main, fastest) or Direct3D 12 (Windows). Changing it in the Insert menu applies on the next start. |
 | Resolution | What the 3D scene renders at: your screen's resolutions are listed, 1280 x 720 is the original. The game's image is 16:9 and fits inside the chosen size. With Vulkan it changes at once in the Insert menu; with Direct3D 12 it follows Effects and HUD. |
 | Effects and HUD | What the effects (bloom, blur, the final image) and the HUD render at: 1x (720p), 2x (1440p), 3x (4K), or Automatic, the nearest one to the resolution. Lower is faster. Applies on the next start. |
