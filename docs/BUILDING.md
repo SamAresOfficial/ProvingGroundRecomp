@@ -29,7 +29,11 @@ Requirements:
 .\build.ps1                                # Release
 .\build.ps1 -Configuration RelWithDebInfo  # symbols, frame counters, Tracy
 .\build.ps1 -LlvmBin C:\path\to\llvm\bin   # a specific Clang
+.\build.ps1 -Install                       # also install to %LOCALAPPDATA%\Programs\ProvingGroundRecomp
+                                           # and add a Start menu shortcut (-InstallDir to change)
 ```
+
+`-Install` copies over an existing install and keeps its `pg.toml` and `logs`.
 
 Keep the repository in a short path (for example `C:\src\ProvingGroundRecomp`): some SDK
 files have long names. Other options: `-Jobs`, `-CodegenOnly`, `-NoStage`, `-SdkSource` (use

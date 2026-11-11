@@ -2,6 +2,7 @@
 #
 #   .\build.ps1                      Release build in out\build\release, staged in out\dist
 #   .\build.ps1 -Configuration RelWithDebInfo   Build with symbols and performance counters
+#   .\build.ps1 -Install             Also copy the build to -InstallDir and add a Start menu shortcut
 #
 # Steps: fetch ReXGlue v0.10.0 into thirdparty\rexglue-sdk and apply patches\rexglue-sdk.patch
 # (first run only), build the rexglue code generator, generate code from assets\default.xex,
@@ -24,10 +25,15 @@ param(
     # Only generate the code; do not build the game.
     [switch]$CodegenOnly,
     # Skip copying the game and its libraries to out\dist.
-    [switch]$NoStage
+    [switch]$NoStage,
+    # After staging, copy the game to -InstallDir (keeping pg.toml, logs and anything else already
+    # there) and create or refresh a "Proving Ground Recompiled" Start menu shortcut.
+    [switch]$Install,
+    [string]$InstallDir = (Join-Path $env:LOCALAPPDATA 'Programs\ProvingGroundRecomp')
 )
 
 $ErrorActionPreference = 'Stop'
+if ($Install -and ($NoStage -or $CodegenOnly)) { throw '-Install cannot be combined with -NoStage or -CodegenOnly.' }
 $FidelityFX = -not $NoFidelityFX
 $D3D12 = -not $NoD3D12
 $repo = $PSScriptRoot
@@ -92,6 +98,21 @@ if ($SdkSource) {
     } elseif ((Get-Content -LiteralPath $marker -Raw).Trim() -ne $patchHash) {
         Write-Warning ("patches\rexglue-sdk.patch changed since thirdparty\rexglue-sdk was patched. " +
             'Delete thirdparty\rexglue-sdk to fetch and patch it again.')
+    }
+}
+
+# The SDK is cloned with core.symlinks=false (symlinks need Developer Mode or admin on Windows), so
+# libmspack's symlinked sources in cabextract\mspack, which the SDK compiles from, are checked out as
+# one-line text files holding the link target. Replace each with the file it points to.
+$mspack = Join-Path $sdk 'thirdparty\libmspack\cabextract\mspack'
+if (Test-Path -LiteralPath $mspack) {
+    Get-ChildItem -LiteralPath $mspack -File | Where-Object { $_.Length -gt 0 -and $_.Length -lt 256 } | ForEach-Object {
+        $link = (Get-Content -LiteralPath $_.FullName -Raw).Trim()
+        if ($link -match '^\.\.[\\/][\w.\\/-]+$') {
+            $target = [IO.Path]::GetFullPath((Join-Path $mspack $link))
+            if (-not (Test-Path -LiteralPath $target -PathType Leaf)) { throw "libmspack link target is missing: $target" }
+            Copy-Item -LiteralPath $target -Destination $_.FullName -Force
+        }
     }
 }
 
@@ -248,4 +269,22 @@ if (-not $NoStage) {
     Write-Host "Ready to play: $dist\ProvingGround.exe" -ForegroundColor Green
 } else {
     Write-Host "Built: $exe" -ForegroundColor Green
+}
+
+if ($Install) {
+    $installExe = Join-Path $InstallDir 'ProvingGround.exe'
+    $running = Get-Process -Name 'ProvingGround' -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path -and ($_.Path -ieq $installExe) }
+    if ($running) { throw "The game is running from $InstallDir. Close it and run the install again." }
+    New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+    # Copy over the top: pg.toml, logs and portable.txt are not in the staged build and stay as they are.
+    Copy-Item -Path (Join-Path $dist '*') -Destination $InstallDir -Recurse -Force
+    $shortcut = Join-Path ([Environment]::GetFolderPath('Programs')) 'Proving Ground Recompiled.lnk'
+    $link = (New-Object -ComObject WScript.Shell).CreateShortcut($shortcut)
+    $link.TargetPath = $installExe
+    $link.WorkingDirectory = $InstallDir
+    $link.IconLocation = "$installExe,0"
+    $link.Description = "Tony Hawk's Proving Ground (Recompiled)"
+    $link.Save()
+    Write-Host "Installed: $installExe (Start menu: Proving Ground Recompiled)" -ForegroundColor Green
 }
