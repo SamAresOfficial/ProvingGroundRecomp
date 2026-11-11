@@ -173,11 +173,16 @@ bool FsrUseful() {
   return uint32_t(std::lround(RenderResolutionFactor() * 720.0)) <= DisplayHeight();
 }
 
+// FSR chosen and with something to do at this resolution: what the settings that make room for
+// it (the effects and HUD scale) follow. Chosen for a resolution above the screen's, it is
+// inactive and changes nothing.
+bool FsrWanted() { return FsrSelected() && FsrUseful(); }
+
 // FSR needs the final image at the size of the 3D scene, which is so with the effects and the
 // HUD at 1x (they then follow the resolution): a game started at another scale gets it after a
 // restart.
 bool FsrEnabled() {
-  return FsrSelected() && FsrUseful() && (!g_running_scale || g_running_scale == 1);
+  return FsrWanted() && (!g_running_scale || g_running_scale == 1);
 }
 
 // render_resolution as width and height: WIDTHxHEIGHT, or one of the older names.
@@ -204,7 +209,7 @@ int32_t RenderResolutionScale() {
   // With FSR, everything renders at the resolution (the 3D scene's own scale), which FSR takes
   // to the screen: a whole-number scale for the effects and the HUD would make the final image a
   // resampled 3D scene, which FSR can't work on.
-  if (FsrSelected()) return 1;
+  if (FsrWanted()) return 1;
   const std::string effects = REXCVAR_GET(effects_resolution);
   if (effects == "1" || effects == "2" || effects == "3") return effects[0] - '0';
   return std::clamp(int32_t(std::lround(RenderResolutionFactor())), 1, 3);
@@ -1015,8 +1020,9 @@ bool AntiAliasingSetting() {
     }
     choices.push_back({"fsr", fsr_label.c_str()});
   }
-  const std::string current =
-      FsrSelected() && fsr_useful ? "fsr" : SettingValue("swap_post_effect", "none");
+  // Shown as chosen also while the resolution is above the screen's (it is inactive then), so
+  // it can be seen and switched off.
+  const std::string current = FsrSelected() ? "fsr" : SettingValue("swap_post_effect", "none");
   const char* preview = current.c_str();
   for (const auto& choice : choices) {
     if (current == choice.value) preview = choice.label;
@@ -1170,10 +1176,15 @@ bool GraphicsSettings(bool in_game) {
     changed |= ComboSetting("Renderer", "renderer", kRenderers, kRendererHelp);
   }
   if (ResolutionSetting()) {
-    if (in_game) ApplyResolutionLive();
+    // Whether FSR runs depends on the resolution (not above the screen's), so the presenter's
+    // effect follows it too.
+    if (in_game) {
+      ApplyResolutionLive();
+      ApplyUpscaler();
+    }
     changed = true;
   }
-  if (FsrSelected()) {
+  if (FsrWanted()) {
     MutedNote("With AMD FSR, the effects and the HUD render at the resolution.");
   } else {
     changed |= EffectsResolutionSetting();
@@ -1194,7 +1205,10 @@ bool GraphicsSettings(bool in_game) {
   }
   const bool fsr = FsrEnabled();
   if (FsrSelected() && FsrQualitySetting()) {
-    if (in_game) ApplyResolutionLive();
+    if (in_game) {
+      ApplyResolutionLive();
+      ApplyUpscaler();
+    }
     changed = true;
   }
   if (fsr && UsingD3D12() && !rex::cvar::GetFlagByName("d3d12_fsr_versions").empty()) {
@@ -1469,7 +1483,7 @@ void LauncherSettingsPage(LauncherState& state) {
   }
   if (D3D12Available()) ComboSetting("Renderer", "renderer", kRenderers, kRendererHelp);
   ResolutionSetting();
-  if (!FsrSelected()) EffectsResolutionSetting();
+  if (!FsrWanted()) EffectsResolutionSetting();
   ComboSetting("Texture filtering", "anisotropic_override", kTextureFiltering,
                kTextureFilteringHelp, "3");
   AntiAliasingSetting();

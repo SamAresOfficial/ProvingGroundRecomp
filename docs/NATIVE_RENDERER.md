@@ -1310,7 +1310,13 @@ guest frame, and the presenter only places the result:
   the HUD mask. The mask goes to FSR as reactive and transparency-and-composition mask, and
   after FSR a compute pass puts the bilinearly scaled final image over the output where the mask
   is set (the HUD is not jittered, so through FSR it would wobble by the jitter).
-- **Reset.** On the first frame, a new upscaler or size, a frame without a camera (menus,
+- **What FidelityFX is told about the images** (checked against its Vulkan backend,
+  `ffx_vk.cpp`): the inputs are sampled, read-only color images in
+  `SHADER_READ_ONLY_OPTIMAL`, the depth too (an R32F copy; the depth-target usage would make
+  the backend create a D32 depth-aspect view and barrier of it, which is invalid); the output is
+  a storage image in `GENERAL`, left there. No exposure image (auto exposure).
+- **Reset.** On the first frame, a new upscaler or size, a new render size (the previous camera
+  is dropped too, it maps to pixels of the old size), a frame without a camera (menus,
   loading, videos: constant depth, zero vectors, reset every frame), more than 500 ms since the
   last swap, a missed refresh, and a camera cut: far points or a near point reprojecting more
   than `fsr_temporal_camera_cut` of the width away, or behind the camera.
@@ -1320,7 +1326,8 @@ guest frame, and the presenter only places the result:
   `VulkanPresenter::RecordTemporalUpscale` when the stream is executed (on the submission thread
   with `vulkan_async_submission`). The upscaler is created by the command processor thread after
   awaiting every earlier submission, so the two never overlap. If the dispatch fails there, a
-  bilinear blit writes the output instead.
+  bilinear blit writes the output instead (the guest output images have the transfer
+  destination usage for it).
 - **Fallbacks.** No FidelityFX runtime, creation failed, render size above the output size, the
   3D scene not at the final image's size (`resolution_scale` above 1 with another own scale),
   `fsr_temporal_upscaling=false`: the guest output stays at render size and the presenter paints
