@@ -95,18 +95,25 @@ The cutscene cameras only see whole vblanks, so their poses change at most 60 ti
 Uncapped, `sub_8234BD00` runs the original callback only when `EngineVblankClock` says a step is
 due. The steps are counted when the main loop hands over a frame (`sub_824852F8`): the 1/60 s
 elapsed since the last frame, rounded to whole steps. The part not given is carried to the next
-frame, and that carried part is pulled slowly toward zero, so the steps stay in phase with the
-frames even after the limiter restarts its schedule. The vblank interrupt still delivers the
-steps, within a millisecond, so the callback keeps its thread and arguments. While the main
-loop hands over no frames for 100 ms (loading screens), the interrupt advances the clock at the
-real 1/60 s boundaries itself.
+frame and only ever changed by real time and the steps given, so the count follows real time
+exactly. A separate bias, held within a step, moves the rounding point toward the frames'
+phase, so the steps stay in phase with the frames even after the limiter restarts its schedule.
+It acts only when the frames last a simple fraction of a step (near 30, 45, 60, 90, 120 and
+240 FPS). When the frames drift against real time (59.94 FPS) the bias follows them until it
+has moved three quarters of a step, then jumps by a whole step: one frame gets two steps instead
+of one, and the rounding never sits near half a step where jitter flips it. Switching to 30 FPS
+and back restarts the clock, so no time spent capped is caught up. The vblank interrupt still
+delivers the steps, within a millisecond, so the callback keeps its thread and arguments. While
+the main loop hands over no frames for 100 ms (loading screens), the interrupt advances the
+clock at the real 1/60 s boundaries itself.
 
 - At 60 FPS every frame sees exactly one step. Before, the steps fell at real 1/60 s boundaries
   with no fixed phase to the frames, and frames near a boundary saw 0 or 2 steps (judder).
 - Above 60 FPS the steps are as evenly spaced as whole steps allow: at 120 FPS one every other
   frame, and at 144 FPS gaps of 2 and 3 frames. Camera pans are still only 60 poses a second.
-- Cutscene speed stays within a few hundredths of a percent of real time (the pull trades that
-  much for a steady phase at some frame rates).
+- Cutscene speed follows real time: at any frame rate the count stays within 1.25 steps (21 ms)
+  of it, apart from stalls over 133 ms, which skip ahead as before. At 59.94 FPS one frame in
+  1000 sees two steps. A simulation of 9-240 FPS over 10 minutes drifted under 0.01%.
 - `--cutscene_clock_follows_frames=false` (hot reload) restores the free-running real-time
   steps, to compare.
 - Capped (30 FPS, vsync) the hooks are not involved: every vblank runs the original callback.
@@ -128,7 +135,7 @@ generated code (and the xex), which the fix above was made without:
    registers by reference (`PPCRegister&`), so declare it in a header listed in
    `[entrypoint] includes` and define it in `src/`. While `Uncapped()`, replace the value with the
    integer count plus the fraction of a step elapsed since the last step, from
-   `EngineVblankClock` (it knows when the last step was given and how much time is pending). Keep
+   `EngineVblankClock` (it knows when the last step was given and how much time is owed). Keep
    the fraction below 1, so the camera never reads ahead of the next whole count. Regenerate
    (`build.ps1` runs codegen when the config changes).
 4. If the camera does integer math on the count (segment lookups, `divw`, comparisons) before

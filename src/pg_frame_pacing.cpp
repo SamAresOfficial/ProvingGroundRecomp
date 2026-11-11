@@ -398,15 +398,19 @@ namespace {
 // Advancing it at real 1/60 s boundaries kept the speed right, but a boundary has no fixed phase
 // relative to the game's frames: at 60 FPS frames close to a boundary saw 0 or 2 steps, a visible
 // judder in camera pans, and above 60 FPS the steps fell unevenly (gaps of 1, 2 or 3 frames at
-// 120 FPS). So the clock advances when the main loop hands over a frame, by the 1/60 s elapsed
-// since the last frame rounded to whole steps. The part not given is carried to the next frame,
-// so in the long run the count follows real time, and it is pulled slowly toward zero. Without
-// that pull the carried part would keep whatever phase the first frame had, and the frame limiter
-// restarting its schedule after a late frame would sooner or later leave it near half a step,
-// where timer jitter brings back the 0/2 steps. With it, at 60 FPS every frame sees one step, and
-// at other rates the steps are spaced as evenly as whole steps allow. The pull costs at most a
-// few hundredths of a percent of cutscene speed at some frame rates (measured in a simulation of
-// 45-240 FPS with timer jitter and late frames).
+// 120 FPS). So the clock advances when the main loop hands over a frame: it adds the 1/60 s
+// elapsed since the last frame to the time owed, and gives the nearest whole number of steps.
+//
+// The time owed is never changed other than by real time and the steps given, so the count
+// follows real time exactly in the long run: at 59.94 FPS (the real rate of most 60 Hz displays)
+// one frame in 1000 gets two steps, and cutscenes don't run slow. Rounding alone would keep the
+// steps at whatever phase the first frame had, and the frame limiter restarting its schedule
+// after a late frame would sooner or later leave that phase near half a step, where timer jitter
+// brings back the 0/2 steps. So when the frames last a simple fraction of a step (1, 1/2, 2/3,
+// 1/4: near 60, 120, 90 and 240 FPS, and 30 and 45), a separate bias moves the rounding point
+// toward the frames' phase. It is held within a step, so it can delay or advance a step but never
+// lose or gain time. At other rates (144 FPS: 5 steps in 12 frames) the pattern is too long to
+// hold, and plain rounding spaces the steps as evenly as whole steps allow.
 //
 // The steps are still delivered by the vblank interrupt, at most a millisecond after the frame
 // was handed over (right after the swap with vblank_after_swap), so the callback keeps running on
@@ -415,15 +419,40 @@ namespace {
 // at the real 1/60 s boundaries, as before.
 //
 // The cameras could move smoothly at any frame rate only with a fractional clock: see
-// docs/DEVELOPMENT.md, "Frame pacing", for how to give sub_82432538 one.
+// docs/DEVELOPMENT.md, "Cutscene camera clock", for how to give sub_82432538 one.
 class EngineVblankClock {
  public:
   // The main loop handed over a frame.
   void OnMainLoopFrame(Clock::time_point now) {
     std::lock_guard lock(mutex_);
     last_frame_ = now;
-    Advance(now, /*nearest=*/true);
-    pending_ -= kPhasePull * pending_;
+    const double elapsed = AddElapsed(now);
+    frame_steps_ = frame_steps_ > 0.0
+                       ? frame_steps_ + kFrameStepsSmoothing * (elapsed - frame_steps_)
+                       : elapsed;
+    Give(std::floor(owed_ + bias_ + 0.5));
+    // Frames of about n/q steps (q = 1 near 60 and 30 FPS, 2 near 120, 3 near 45 and 90, 4 near
+    // 240) repeat a pattern of q rounding phases, 1/q of a step apart. Within kMaxPhaseDrift of a
+    // phase per frame the bias can hold one.
+    double q = 0.0;
+    for (double n = 1.0; n <= 4.0; n += 1.0) {
+      const double phases = n * frame_steps_;
+      if (phases >= 0.5 && std::fabs(phases - std::round(phases)) < kMaxPhaseDrift) {
+        q = n;
+        break;
+      }
+    }
+    if (q == 0.0) return;
+    // Move the rounding point toward this frame's phase: afterwards owed_ + bias_ is nearer 0
+    // (with q phases, they sit symmetrically about 0 and their pulls cancel).
+    bias_ -= kPhasePull * (owed_ + bias_);
+    // When the frames drift against real time (59.94 FPS), the bias follows them until it is
+    // three quarters of a phase away. It then moves by a whole phase, so one frame gets a step
+    // more or less (or, with q > 1, a gap between steps is one frame shorter or longer), and
+    // settles again. Taking the slip at once avoids rounding near half a step for many frames,
+    // where jitter gave 0 and 2 steps in turn.
+    while (bias_ < -kWrapBias / q) bias_ += 1.0 / q;
+    while (bias_ > kWrapBias / q) bias_ -= 1.0 / q;
   }
 
   // Called on each vblank interrupt: returns the number of engine vblanks to deliver now.
@@ -431,42 +460,71 @@ class EngineVblankClock {
     std::lock_guard lock(mutex_);
     if (!follow_frames || last_frame_ == Clock::time_point{} ||
         now - last_frame_ > kFrameTimeout) {
-      Advance(now, /*nearest=*/false);
+      AddElapsed(now);
+      // Only whole 1/60 s that have passed.
+      Give(std::floor(owed_));
     }
     const uint64_t due = target_ - delivered_;
     delivered_ = target_;
     return due;
   }
 
+  // Called on each vblank while capped, when the hook runs the original on every vblank: the
+  // clock restarts from the next uncapped vblank or frame, rather than counting the time spent
+  // capped (which the original has counted already) as a stall to catch up on.
+  void Suspend() {
+    std::lock_guard lock(mutex_);
+    last_ = {};
+    last_frame_ = {};
+    owed_ = 0.0;
+    bias_ = 0.0;
+    frame_steps_ = 0.0;
+  }
+
  private:
   // After this long without a frame the interrupt advances the clock on its own. It is longer
   // than any frame the game shows outside loading screens.
   static constexpr auto kFrameTimeout = std::chrono::milliseconds(100);
-  // Most steps given at once: after a longer stall (or time spent capped) the count skips ahead,
-  // as the game would see after a stall. Above kFrameTimeout, so frames down to 10 FPS lose none.
+  // Most steps owed at once: after a longer stall the count skips ahead, as the game would see
+  // after a stall. Above kFrameTimeout, so frames down to 10 FPS lose none.
   static constexpr double kMaxCatchUp = 8.0;
-  // Fraction of the carried part removed per frame; about 50 frames to settle on a new phase.
-  static constexpr double kPhasePull = 0.02;
+  // Fraction of the phase error corrected per frame: about 10 frames to settle on a new phase,
+  // while timer jitter (a few hundredths of a step) moves it little.
+  static constexpr double kPhasePull = 0.1;
+  // Bound of the bias, in phases (whole steps near 60 FPS, half steps near 120 and so on), so
+  // owed_ stays within 1.25 steps of zero. Beyond half a phase, so a bias that moved by a whole
+  // phase must come half a phase back before it moves again.
+  static constexpr double kWrapBias = 0.75;
+  // Most drift of the frames against a phase pattern, in phases per frame, for the bias to hold
+  // it (59.94 FPS drifts 0.001; 165 FPS, 0.09 from thirds of a step, is left to plain rounding).
+  static constexpr double kMaxPhaseDrift = 0.03;
+  // Weight of each frame in the average frame length, so one late frame doesn't change the mode.
+  static constexpr double kFrameStepsSmoothing = 0.1;
 
-  void Advance(Clock::time_point now, bool nearest) {
+  // Returns the steps of time added.
+  double AddElapsed(Clock::time_point now) {
+    double elapsed = 0.0;
     if (last_ != Clock::time_point{}) {
-      pending_ += std::min(std::chrono::duration<double>(now - last_).count() * 60.0, kMaxCatchUp);
+      elapsed = std::min(std::chrono::duration<double>(now - last_).count() * 60.0, kMaxCatchUp);
+      owed_ += elapsed;
     }
     last_ = now;
-    // From frames, the nearest whole step (the carried part stays within half a step either
-    // way); from the interrupt, only whole 1/60 s that have passed. A part carried below zero
-    // from frames gives no step until it is made up.
-    const double steps = nearest ? std::floor(pending_ + 0.5) : std::floor(pending_);
+    return elapsed;
+  }
+
+  void Give(double steps) {
     if (steps > 0.0) {
-      pending_ -= steps;
+      owed_ -= steps;
       target_ += uint64_t(steps);
     }
   }
 
   std::mutex mutex_;
-  Clock::time_point last_;        // when the clock last advanced
+  Clock::time_point last_;        // when elapsed time was last added
   Clock::time_point last_frame_;  // when the main loop last handed over a frame
-  double pending_ = 0.0;          // 1/60 s elapsed but not yet given as steps
+  double owed_ = 0.0;             // 1/60 s elapsed but not yet given as steps
+  double bias_ = 0.0;             // shift of the frames' rounding point, in steps
+  double frame_steps_ = 0.0;      // average frame length, in steps (0 until the first frame)
   uint64_t target_ = 0;           // steps given
   uint64_t delivered_ = 0;        // steps delivered to the game by the interrupt
 };
@@ -478,6 +536,7 @@ EngineVblankClock engine_vblank_clock;
 extern "C" void __imp__sub_8234BD00(PPCContext& __restrict ctx, uint8_t* base);
 extern "C" void sub_8234BD00(PPCContext& __restrict ctx, uint8_t* base) {
   if (!Uncapped()) {
+    engine_vblank_clock.Suspend();
     __imp__sub_8234BD00(ctx, base);
     return;
   }
