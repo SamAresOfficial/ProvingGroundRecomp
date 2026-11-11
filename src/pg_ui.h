@@ -125,10 +125,14 @@ class GameMenu final : public rex::ui::ImGuiDialog {
   bool focused_ = false;
 };
 
-// Small frame rate readout in the corner, shown with the show_fps setting.
+// Small frame rate readout in the corner, shown with the show_fps setting. It is attached to the
+// drawer only while the setting is on: any attached dialog makes the presenter paint on the UI
+// thread, which adds latency and keeps presentation from pacing the game on the vblanks.
 class FpsOverlay final : public rex::ui::ImGuiDialog {
  public:
-  explicit FpsOverlay(rex::ui::ImGuiDrawer* drawer) : ImGuiDialog(drawer) {}
+  explicit FpsOverlay(rex::ui::ImGuiDrawer* drawer);
+  // Attaches or detaches the overlay to follow show_fps (UI thread).
+  void Refresh();
   // Updated with the game's frames; repainting the window continuously for it presented the
   // same frame (with FSR) a few hundred times a second.
   bool WantsContinuousRepaint() const override { return false; }

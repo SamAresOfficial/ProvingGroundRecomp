@@ -173,10 +173,10 @@ void LimitFrameRate() {
   // the game's swap waits for the GPU thread. A timer at 1 / limit as well would beat against
   // the real refresh rate (59.94 Hz is not 60) and make the presenter miss vblanks, so it steps
   // aside. Where the presenter can't hold a frame for several vblanks (Vulkan without present
-  // wait), the timer runs at whole refreshes of the measured rate instead of 1 / limit, so the
-  // frames don't drift against the scan-out. The presenter's report lapses when it stops
-  // presenting (minimized, or the Insert menu painting on the UI thread), and the timer takes
-  // over again.
+  // wait, or painting on the UI thread while a menu or overlay is shown), the timer runs at
+  // whole refreshes of the measured rate instead of 1 / limit, so the frames don't drift against
+  // the scan-out. The presenter's report lapses when it stops presenting (minimized), and the
+  // timer takes over again.
   double display_period = 0.0;
   const rex::ui::present_sync::Pacing pacing = rex::ui::present_sync::GetPacing(&display_period);
   if (pacing == rex::ui::present_sync::Pacing::kPresenter) {

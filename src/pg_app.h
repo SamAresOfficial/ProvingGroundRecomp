@@ -262,6 +262,13 @@ class PgApp : public rex::ReXApp {
       pg::SaveSettings(config_path_);
     });
     fps_overlay_ = std::make_unique<pg::FpsOverlay>(drawer);
+    // show_fps changes from the Insert menu, the launcher or the console (any thread, under the
+    // cvar registry's lock): follow it on the UI thread.
+    rex::cvar::RegisterChangeCallback("show_fps", [this](std::string_view, std::string_view) {
+      app_context().CallInUIThreadDeferred([this] {
+        if (fps_overlay_) fps_overlay_->Refresh();
+      });
+    });
     pg::SetPresenterSource([drawer] { return drawer->presenter(); });
     pg::ApplyUpscaler();
   }
@@ -307,6 +314,7 @@ class PgApp : public rex::ReXApp {
     launcher_.reset();
     CloseMenu();
     drawer_ = nullptr;
+    rex::cvar::UnregisterChangeCallbacks("show_fps");
     fps_overlay_.reset();
     rex::ui::UnregisterBind("bind_pg_menu");
     rex::ui::UnregisterBind("bind_pg_fullscreen");

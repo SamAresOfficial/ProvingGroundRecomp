@@ -2557,10 +2557,10 @@ index 30b207d..2149428 100644
    kSuccess,
    kAlerted,
 diff --git a/include/rex/ui/d3d12/d3d12_presenter.h b/include/rex/ui/d3d12/d3d12_presenter.h
-index 83d09f7..2f9d4b9 100644
+index 83d09f7..6839d1c 100644
 --- a/include/rex/ui/d3d12/d3d12_presenter.h
 +++ b/include/rex/ui/d3d12/d3d12_presenter.h
-@@ -251,6 +251,12 @@ class D3D12Presenter final : public Presenter {
+@@ -251,6 +251,13 @@ class D3D12Presenter final : public Presenter {
      uint32_t swap_chain_width = 0;
      uint32_t swap_chain_height = 0;
      bool swap_chain_allows_tearing = false;
@@ -2568,12 +2568,13 @@ index 83d09f7..2f9d4b9 100644
 +    UINT swap_chain_flags = 0;
 +    // Signaled when the swap chain can take another present within its maximum frame latency.
 +    HANDLE frame_latency_waitable = nullptr;
-+    // The maximum frame latency last set, 0 if not set yet.
-+    UINT frame_latency = 0;
++    // Presents made after a wait on frame_latency_waitable timed out. Each will release a count
++    // that no wait took, letting a frame more queue up, so later waits take these back.
++    uint32_t frame_latency_debt = 0;
      Microsoft::WRL::ComPtr<IDXGISwapChain3> swap_chain;
      std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, kSwapChainBufferCount> swap_chain_buffers;
    };
-@@ -262,7 +268,7 @@ class D3D12Presenter final : public Presenter {
+@@ -262,7 +269,7 @@ class D3D12Presenter final : public Presenter {
  
    bool InitializeSurfaceIndependent();
  
@@ -2582,7 +2583,7 @@ index 83d09f7..2f9d4b9 100644
    bool EnsureTemporalUpscalerContext(uint32_t render_width, uint32_t render_height,
                                       uint32_t output_width, uint32_t output_height);
    bool DispatchTemporalUpscaler(ID3D12GraphicsCommandList* command_list,
-@@ -312,13 +318,18 @@ class D3D12Presenter final : public Presenter {
+@@ -312,13 +319,18 @@ class D3D12Presenter final : public Presenter {
    // well as by presenter initialization and shutdown.
    PaintContext paint_context_;
  
@@ -2634,10 +2635,10 @@ index 0000000..85e64d9
 +
 +}  // namespace rex::ui
 diff --git a/include/rex/ui/imgui_dialog.h b/include/rex/ui/imgui_dialog.h
-index a7ab6b3..fb3dafc 100644
+index a7ab6b3..013ad04 100644
 --- a/include/rex/ui/imgui_dialog.h
 +++ b/include/rex/ui/imgui_dialog.h
-@@ -39,6 +39,11 @@ class ImGuiDialog {
+@@ -39,10 +39,25 @@ class ImGuiDialog {
  
    void Draw();
  
@@ -2648,7 +2649,29 @@ index a7ab6b3..fb3dafc 100644
 +
   protected:
    ImGuiDialog(ImGuiDrawer* imgui_drawer);
++  // A dialog constructed detached isn't drawn until SetAttached(true).
++  ImGuiDialog(ImGuiDrawer* imgui_drawer, bool attached);
  
+   ImGuiDrawer* imgui_drawer() const { return imgui_drawer_; }
++
++  // Adds the dialog to the drawer or removes it (UI thread; also from within OnDraw). While any
++  // dialog is attached, the presenter paints on the UI thread, from window paint events, instead
++  // of presenting each guest frame from the GPU thread: that adds latency and keeps
++  // presentation from pacing the guest on the vblanks. A passive overlay with nothing to show
++  // should stay detached.
++  void SetAttached(bool attached);
++  bool attached() const { return attached_; }
+   ImGuiIO& GetIO();
+ 
+   // Closes the dialog and returns to any waiters.
+@@ -54,6 +69,7 @@ class ImGuiDialog {
+ 
+  private:
+   ImGuiDrawer* imgui_drawer_ = nullptr;
++  bool attached_ = false;
+   bool has_close_pending_ = false;
+   std::vector<rex::thread::Fence*> waiting_fences_;
+ };
 diff --git a/include/rex/ui/imgui_drawer.h b/include/rex/ui/imgui_drawer.h
 index a570fa0..ec792aa 100644
 --- a/include/rex/ui/imgui_drawer.h
@@ -2661,16 +2684,39 @@ index a570fa0..ec792aa 100644
    void SetImmediateDrawer(ImmediateDrawer* new_immediate_drawer);
    void SetPresenterAndImmediateDrawer(Presenter* new_presenter,
                                        ImmediateDrawer* new_immediate_drawer) {
+diff --git a/include/rex/ui/overlay/achievement_notification.h b/include/rex/ui/overlay/achievement_notification.h
+index f9921ed..79931e9 100644
+--- a/include/rex/ui/overlay/achievement_notification.h
++++ b/include/rex/ui/overlay/achievement_notification.h
+@@ -19,11 +19,12 @@ class AchievementNotificationDialog : public ImGuiDialog {
+  public:
+   ~AchievementNotificationDialog() override = default;
+ 
+-  // Thread-safe implementations may receive events from guest threads.
++  // Called on the UI thread (the app forwards events from guest threads there).
+   virtual void Push(const rex::system::AchievementEvent& event) = 0;
+ 
+  protected:
+-  explicit AchievementNotificationDialog(ImGuiDrawer* drawer) : ImGuiDialog(drawer) {}
++  // Detached: the dialog attaches itself only while it has a notification to show.
++  explicit AchievementNotificationDialog(ImGuiDrawer* drawer) : ImGuiDialog(drawer, false) {}
+ };
+ 
+ }  // namespace rex::ui
 diff --git a/include/rex/ui/overlay/achievement_toast.h b/include/rex/ui/overlay/achievement_toast.h
-index 7642601..c4c1402 100644
+index 7642601..794b9a8 100644
 --- a/include/rex/ui/overlay/achievement_toast.h
 +++ b/include/rex/ui/overlay/achievement_toast.h
-@@ -35,6 +35,10 @@ class AchievementToastDialog : public AchievementNotificationDialog {
-   // Thread-safe: safe to call from any thread, including guest threads.
+@@ -32,9 +32,13 @@ class AchievementToastDialog : public AchievementNotificationDialog {
+                          rex::Runtime* runtime);
+   ~AchievementToastDialog() override;
+ 
+-  // Thread-safe: safe to call from any thread, including guest threads.
++  // UI thread. Attaches the dialog until the queue has been shown.
    void Push(const rex::system::AchievementEvent& event) override;
  
-+  // Always present; it repaints the window continuously only while a toast is shown, so an
-+  // empty queue does not present the same frame hundreds of times a second.
++  // Attached only while a toast is queued or shown, and repaints continuously then (for the
++  // fades).
 +  bool WantsContinuousRepaint() const override;
 +
   protected:
@@ -2839,7 +2885,7 @@ index 0000000..18b425f
 +
 +}  // namespace rex::ui::present_sync
 diff --git a/include/rex/ui/presenter.h b/include/rex/ui/presenter.h
-index afb4a30..802c2f1 100644
+index afb4a30..c2373b1 100644
 --- a/include/rex/ui/presenter.h
 +++ b/include/rex/ui/presenter.h
 @@ -1,4 +1,7 @@
@@ -2994,23 +3040,27 @@ index afb4a30..802c2f1 100644
  
    explicit Presenter(HostGpuLossCallback host_gpu_loss_callback)
        : host_gpu_loss_callback_(host_gpu_loss_callback) {}
-@@ -716,6 +727,15 @@ class Presenter {
+@@ -716,6 +727,19 @@ class Presenter {
    // Call via PaintAndPresent.
    virtual PaintResult PaintAndPresentImpl(bool execute_ui_drawers) = 0;
  
 +  // Set by PaintAndPresentImpl to how its present paces the frames (see present_sync.h).
-+  // Reported to the app by PaintAndPresent after a present from the guest output thread only:
-+  // when the UI thread paints, new guest frames replace each other in the mailbox instead of
-+  // waiting for the vblanks, so the app's limiter must keep the guest's rate.
++  // Reported to the app by PaintAndPresent after each present. kPresenter counts only from the
++  // guest output thread: when the UI thread paints, new guest frames replace each other in the
++  // mailbox instead of waiting for the vblanks, so it becomes kAppAtDisplayPeriod there.
 +  void SetPaintPacing(present_sync::Pacing pacing, double frame_period_seconds = 0.0) {
 +    paint_pacing_ = pacing;
 +    paint_pacing_period_ = frame_period_seconds;
 +  }
++  // Within PaintAndPresentImpl: whether this paint is on the thread refreshing the guest output
++  // (which then holds paint_mode_mutex_, so it must not block indefinitely), rather than on the
++  // UI thread.
++  bool IsPaintingFromGuestOutputThread() const { return painting_from_guest_output_thread_; }
 +
    // For calling from the painting implementations if requested.
    void ExecuteUIDrawersFromUIThread(UIDrawContext& ui_draw_context);
  
-@@ -829,6 +849,8 @@ class Presenter {
+@@ -829,6 +853,8 @@ class Presenter {
    // dropped when the Window loses its Surface when it's being closed (but the
    // Window object keeps being attached to the Presenter), for instance.
    void UpdateSurfaceMonitorFromUIThread(bool old_monitor_potentially_disconnected);
@@ -3019,13 +3069,25 @@ index afb4a30..802c2f1 100644
    // Platform-specific function returning whether the surface the presenter is
    // currently attached it is actually visible on any monitor. UI thread
    // painting may be dropped if this returns false - need to request painting if
-@@ -992,6 +1014,9 @@ class Presenter {
+@@ -843,7 +869,9 @@ class Presenter {
+   // may not be made outdated if that happens - though if it's
+   // kPresentedSuboptimal rather than kNotPresentedConnectionOutdated, the image
+   // has been successfully sent to the OS presentation at least.
+-  PaintResult PaintAndPresent(bool execute_ui_drawers);
++  // from_guest_output_thread: called by RefreshGuestOutput (the thread refreshing the guest
++  // output, kGuestOutputThreadImmediately) rather than by PaintFromUIThread.
++  PaintResult PaintAndPresent(bool execute_ui_drawers, bool from_guest_output_thread);
+ 
+   void HandleUIDrawersChangeFromUIThread(bool drawers_were_empty);
+ 
+@@ -992,6 +1020,10 @@ class Presenter {
    // deferred and be handled by the tail of PaintFromUIThread for consistency
    // with what PaintFromUIThread does internally.
    bool is_in_ui_thread_paint_ = false;
 +  // Written and read by whichever thread paints (see SetPaintPacing).
 +  present_sync::Pacing paint_pacing_ = present_sync::Pacing::kNone;
 +  double paint_pacing_period_ = 0.0;
++  bool painting_from_guest_output_thread_ = false;
    bool request_guest_output_paint_after_current_ui_thread_paint_;
    bool request_ui_paint_after_current_ui_thread_paint_;
  
@@ -3159,7 +3221,7 @@ index 0000000..f7f0952
 +// VK_KHR_present_wait functions used in Xenia.
 +XE_UI_VULKAN_FUNCTION(vkWaitForPresentKHR)
 diff --git a/include/rex/ui/vulkan/presenter.h b/include/rex/ui/vulkan/presenter.h
-index 56ee43b..0bf3d88 100644
+index 56ee43b..d90251c 100644
 --- a/include/rex/ui/vulkan/presenter.h
 +++ b/include/rex/ui/vulkan/presenter.h
 @@ -12,6 +12,9 @@
@@ -3389,7 +3451,7 @@ index 56ee43b..0bf3d88 100644
  
      // Connection-indepedent.
  
-@@ -414,8 +567,27 @@ class VulkanPresenter final : public Presenter {
+@@ -414,8 +567,29 @@ class VulkanPresenter final : public Presenter {
      VkSwapchainKHR swapchain = VK_NULL_HANDLE;
      VkExtent2D swapchain_extent = {};
      bool swapchain_is_fifo = false;
@@ -3399,6 +3461,8 @@ index 56ee43b..0bf3d88 100644
 +    // last present (0 before the first), when it was queued, and the vblank times learned from
 +    // the waits.
 +    bool swapchain_present_wait_usable = false;
++    // Present waits that timed out in a row; present wait is given up after a few.
++    uint32_t swapchain_present_wait_timeouts = 0;
 +    uint64_t swapchain_last_present_id = 0;
 +    double swapchain_last_present_time = 0.0;
 +    present_sync::VblankClock swapchain_vblank_clock;
@@ -3417,7 +3481,7 @@ index 56ee43b..0bf3d88 100644
    };
  
    explicit VulkanPresenter(HostGpuLossCallback host_gpu_loss_callback,
-@@ -432,18 +604,38 @@ class VulkanPresenter final : public Presenter {
+@@ -432,18 +606,38 @@ class VulkanPresenter final : public Presenter {
  
    bool InitializeSurfaceIndependent();
  
@@ -3462,7 +3526,7 @@ index 56ee43b..0bf3d88 100644
  
    const VulkanDevice* vulkan_device_;
    const UISamplers* ui_samplers_;
-@@ -481,13 +673,81 @@ class VulkanPresenter final : public Presenter {
+@@ -481,13 +675,81 @@ class VulkanPresenter final : public Presenter {
    // well as by presenter initialization and shutdown.
    PaintContext paint_context_;
  
@@ -15788,7 +15852,7 @@ index 5bd3dc5..2d8ee0d 100644
  
  if(REXGLUE_USE_VULKAN)
 diff --git a/src/ui/d3d12/d3d12_presenter.cpp b/src/ui/d3d12/d3d12_presenter.cpp
-index 306118e..5323e08 100644
+index 306118e..b5a7cd1 100644
 --- a/src/ui/d3d12/d3d12_presenter.cpp
 +++ b/src/ui/d3d12/d3d12_presenter.cpp
 @@ -10,9 +10,14 @@
@@ -16091,18 +16155,24 @@ index 306118e..5323e08 100644
      if (REXCVAR_GET(d3d12_allow_variable_refresh_rate_and_tearing) && dxgi_supports_tearing_) {
        // Allow tearing in borderless fullscreen to support variable refresh
        // rate.
-@@ -450,6 +606,10 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
+@@ -450,6 +606,16 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
      paint_context_.swap_chain_height = new_swap_chain_height;
      paint_context_.swap_chain_allows_tearing =
          (swap_chain_desc.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0;
 +    paint_context_.swap_chain_flags = swap_chain_desc.Flags;
++    // One fixed maximum frame latency for the swap chain's life. The waitable object is a
++    // counting semaphore: lowering the latency at run time wouldn't take back counts already
++    // released, so switching between synced and unsynced presents keeps 1 for both. Unsynced,
++    // that waits for the previous paint to be flipped before painting the next one; the guest
++    // frame itself is already submitted by then, so the GPU still has the next frame's work.
++    paint_context_.swap_chain->SetMaximumFrameLatency(1);
 +    paint_context_.frame_latency_waitable =
 +        paint_context_.swap_chain->GetFrameLatencyWaitableObject();
-+    paint_context_.frame_latency = 0;
++    paint_context_.frame_latency_debt = 0;
      for (uint32_t i = 0; i < PaintContext::kSwapChainBufferCount; ++i) {
        if (FAILED(paint_context_.swap_chain->GetBuffer(
                i, IID_PPV_ARGS(&paint_context_.swap_chain_buffers[i])))) {
-@@ -548,6 +708,12 @@ void D3D12Presenter::PaintContext::DestroySwapChain() {
+@@ -548,6 +714,12 @@ void D3D12Presenter::PaintContext::DestroySwapChain() {
    for (Microsoft::WRL::ComPtr<ID3D12Resource>& swap_chain_buffer_ref : swap_chain_buffers) {
      swap_chain_buffer_ref.Reset();
    }
@@ -16110,36 +16180,40 @@ index 306118e..5323e08 100644
 +    CloseHandle(frame_latency_waitable);
 +    frame_latency_waitable = nullptr;
 +  }
-+  frame_latency = 0;
++  frame_latency_debt = 0;
 +  swap_chain_flags = 0;
    swap_chain.Reset();
    swap_chain_allows_tearing = false;
    swap_chain_height = 0;
-@@ -555,6 +721,23 @@ void D3D12Presenter::PaintContext::DestroySwapChain() {
+@@ -555,6 +727,27 @@ void D3D12Presenter::PaintContext::DestroySwapChain() {
  }
  
  Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawers) {
 +  // Synced presentation (present_sync.h) shows each frame for `interval` vblanks, and keeps at
-+  // most one frame queued: the wait below ends at the vblank the previous frame is shown on.
-+  // Unsynced, three frames may be queued, as with the default latency of a swap chain without
-+  // the waitable object. Waiting here blocks the thread presenting, which is the GPU thread
-+  // when there is no UI, and through it the guest's next swap: that holds the guest on the
-+  // vblanks.
++  // most one frame queued (a maximum frame latency of 1): the wait below ends at the vblank the
++  // previous frame is shown on. Waiting here blocks the thread presenting, which is the GPU
++  // thread when there is no UI, and through it the guest's next swap: that holds the guest on
++  // the vblanks.
 +  const present_sync::Decision sync = present_sync::CurrentDecision();
-+  const UINT frame_latency = sync.synchronized ? 1 : 3;
-+  if (paint_context_.frame_latency != frame_latency &&
-+      SUCCEEDED(paint_context_.swap_chain->SetMaximumFrameLatency(frame_latency))) {
-+    paint_context_.frame_latency = frame_latency;
-+  }
-+  if (paint_context_.frame_latency_waitable) {
-+    // Bounded, so a present that never retires (an occluded window) can't hang the GPU thread.
-+    WaitForSingleObjectEx(paint_context_.frame_latency_waitable, 200, TRUE);
++  if (HANDLE waitable = paint_context_.frame_latency_waitable) {
++    // Bounded, so a present that never retires (an occluded window) can't hang the GPU thread,
++    // which holds the paint mode lock the UI thread needs.
++    if (WaitForSingleObjectEx(waitable, 100, FALSE) == WAIT_OBJECT_0) {
++      // Take back the counts of presents made after earlier timeouts, if they have been
++      // released, so the queue returns to one frame.
++      while (paint_context_.frame_latency_debt &&
++             WaitForSingleObjectEx(waitable, 0, FALSE) == WAIT_OBJECT_0) {
++        --paint_context_.frame_latency_debt;
++      }
++    } else {
++      ++paint_context_.frame_latency_debt;
++    }
 +  }
 +
    // Begin the command list with the command allocator not currently potentially
    // used on the GPU.
    UINT64 current_paint_submission = paint_context_.paint_submission_tracker.GetCurrentSubmission();
-@@ -601,6 +784,24 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+@@ -601,6 +794,24 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
      // (and multiple threads can't paint the main target at the same time).
    }
  
@@ -16164,7 +16238,7 @@ index 306118e..5323e08 100644
    if (guest_output_resource) {
      GuestOutputPaintFlow guest_output_flow = GetGuestOutputPaintFlow(
          guest_output_properties, paint_context_.swap_chain_width, paint_context_.swap_chain_height,
-@@ -790,7 +991,7 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+@@ -790,7 +1001,7 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
        D3D12_GPU_DESCRIPTOR_HANDLE view_heap_gpu_start =
            view_heap->GetGPUDescriptorHandleForHeapStart();
        bool temporal_effect_selected = false;
@@ -16173,7 +16247,7 @@ index 306118e..5323e08 100644
        temporal_effect_selected =
            guest_output_paint_config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr2 ||
            guest_output_paint_config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr3;
-@@ -807,7 +1008,7 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+@@ -807,7 +1018,7 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
          bool is_final_effect = i + 1 >= guest_output_flow.effect_count;
  
          GuestOutputPaintEffect effect = guest_output_flow.effects[i];
@@ -16182,7 +16256,7 @@ index 306118e..5323e08 100644
          bool use_temporal_upscaler = is_temporal_easu_effect(i);
  #else
          bool use_temporal_upscaler = false;
-@@ -855,7 +1056,7 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+@@ -855,7 +1066,7 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
            effect_rect_y = 0;
          }
  
@@ -16191,7 +16265,7 @@ index 306118e..5323e08 100644
          bool temporal_dispatch_done = false;
          if (use_temporal_upscaler) {
            uint32_t effect_input_width = 0, effect_input_height = 0;
-@@ -1147,7 +1348,7 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+@@ -1147,7 +1358,7 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
      ui_submission_tracker_.NextSubmission();
    }
    paint_context_.paint_submission_tracker.NextSubmission();
@@ -16200,7 +16274,7 @@ index 306118e..5323e08 100644
    // rate may be something like 144 Hz, which is not a multiple of the common
    // 30 Hz or 60 Hz guest refresh rate), and allowing dropping outdated queued
    // frames for lower latency. Also, if possible, allowing tearing to use
-@@ -1155,9 +1356,19 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+@@ -1155,9 +1366,19 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
    // fullscreen is ever used in, the allow tearing flag must not be passed in
    // fullscreen, but DXGI fullscreen is largely unneeded with the flip
    // presentation model used in Direct3D 12).
@@ -16223,7 +16297,7 @@ index 306118e..5323e08 100644
    // Even if presentation has failed, work might have been enqueued anyway
    // internally before the failure according to Jesse Natalie from the DirectX
    // Discord server.
-@@ -1187,6 +1398,11 @@ bool D3D12Presenter::InitializeSurfaceIndependent() {
+@@ -1187,6 +1408,11 @@ bool D3D12Presenter::InitializeSurfaceIndependent() {
  
    ID3D12Device* device = provider_.GetDevice();
  
@@ -16235,6 +16309,40 @@ index 306118e..5323e08 100644
    // Initialize static guest output painting objects.
  
    // Guest output painting root signatures.
+diff --git a/src/ui/imgui_dialog.cpp b/src/ui/imgui_dialog.cpp
+index 20cec48..270c1bf 100644
+--- a/src/ui/imgui_dialog.cpp
++++ b/src/ui/imgui_dialog.cpp
+@@ -18,12 +18,26 @@
+ namespace rex {
+ namespace ui {
+ 
+-ImGuiDialog::ImGuiDialog(ImGuiDrawer* imgui_drawer) : imgui_drawer_(imgui_drawer) {
+-  imgui_drawer_->AddDialog(this);
++ImGuiDialog::ImGuiDialog(ImGuiDrawer* imgui_drawer) : ImGuiDialog(imgui_drawer, true) {}
++
++ImGuiDialog::ImGuiDialog(ImGuiDrawer* imgui_drawer, bool attached) : imgui_drawer_(imgui_drawer) {
++  SetAttached(attached);
++}
++
++void ImGuiDialog::SetAttached(bool attached) {
++  if (attached_ == attached) {
++    return;
++  }
++  attached_ = attached;
++  if (attached) {
++    imgui_drawer_->AddDialog(this);
++  } else {
++    imgui_drawer_->RemoveDialog(this);
++  }
+ }
+ 
+ ImGuiDialog::~ImGuiDialog() {
+-  imgui_drawer_->RemoveDialog(this);
++  SetAttached(false);
+   for (auto fence : waiting_fences_) {
+     fence->Signal();
+   }
 diff --git a/src/ui/imgui_drawer.cpp b/src/ui/imgui_drawer.cpp
 index f270f3c..4889311 100644
 --- a/src/ui/imgui_drawer.cpp
@@ -16271,21 +16379,45 @@ index f270f3c..4889311 100644
      }
    }
 diff --git a/src/ui/overlay/achievement_toast.cpp b/src/ui/overlay/achievement_toast.cpp
-index 53b8c0b..0dbef1c 100644
+index 53b8c0b..36a76a9 100644
 --- a/src/ui/overlay/achievement_toast.cpp
 +++ b/src/ui/overlay/achievement_toast.cpp
-@@ -29,6 +29,11 @@ void AchievementToastDialog::Push(const rex::system::AchievementEvent& event) {
-   queue_.push_back({event, std::chrono::steady_clock::now()});
- }
+@@ -25,8 +25,16 @@ AchievementToastDialog::AchievementToastDialog(ImGuiDrawer* drawer,
+ AchievementToastDialog::~AchievementToastDialog() {}
  
-+bool AchievementToastDialog::WantsContinuousRepaint() const {
-+  std::lock_guard<std::mutex> lock(mutex_);
-+  return !queue_.empty();
+ void AchievementToastDialog::Push(const rex::system::AchievementEvent& event) {
++  {
++    std::lock_guard<std::mutex> lock(mutex_);
++    queue_.push_back({event, std::chrono::steady_clock::now()});
++  }
++  SetAttached(true);
 +}
 +
- void AchievementToastDialog::OnDraw(ImGuiIO& io) {
-   auto now = std::chrono::steady_clock::now();
++bool AchievementToastDialog::WantsContinuousRepaint() const {
+   std::lock_guard<std::mutex> lock(mutex_);
+-  queue_.push_back({event, std::chrono::steady_clock::now()});
++  return !queue_.empty();
+ }
  
+ void AchievementToastDialog::OnDraw(ImGuiIO& io) {
+@@ -47,10 +55,14 @@ void AchievementToastDialog::OnDraw(ImGuiIO& io) {
+         break;
+       }
+     }
+-    if (queue_.empty()) {
+-      return;
++    if (!queue_.empty()) {
++      toast = queue_.front();
+     }
+-    toast = queue_.front();
++  }
++  if (!toast.visible_since) {
++    // All shown: detach, so the presenter can present from the GPU thread again without a UI.
++    SetAttached(false);
++    return;
+   }
+ 
+   float alpha = 1.0f;
 diff --git a/src/ui/present_sync.cpp b/src/ui/present_sync.cpp
 new file mode 100644
 index 0000000..f1a347c
@@ -16401,7 +16533,7 @@ index 0000000..f1a347c
 +
 +}  // namespace rex::ui::present_sync
 diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
-index 7360ed9..dbc6d73 100644
+index 7360ed9..98c78a6 100644
 --- a/src/ui/presenter.cpp
 +++ b/src/ui/presenter.cpp
 @@ -10,7 +10,9 @@
@@ -16531,6 +16663,15 @@ index 7360ed9..dbc6d73 100644
    PaintResult paint_result = PaintResult::kNotPresented;
    bool request_repaint_at_tick = false;
    bool request_repaint_immediately = false;
+@@ -483,7 +510,7 @@ void Presenter::PaintFromUIThread(bool force_paint) {
+       // doesn't limit the frame rate.
+       WaitForUITickFromUIThread();
+ 
+-      paint_result = PaintAndPresent(draw_ui);
++      paint_result = PaintAndPresent(draw_ui, false);
+       if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedOutdated) {
+         // Request another PaintFromUIThread which will try to recover from the
+         // outdated connection in the next frame (not immediately, so the
 @@ -546,10 +573,12 @@ void Presenter::PaintFromUIThread(bool force_paint) {
    }
  }
@@ -16544,6 +16685,15 @@ index 7360ed9..dbc6d73 100644
    GuestOutputProperties& writable_properties =
        guest_output_properties_[guest_output_mailbox_writable_];
    writable_properties.frontbuffer_width = frontbuffer_width;
+@@ -628,7 +657,7 @@ bool Presenter::RefreshGuestOutput(
+       case PaintMode::kGuestOutputThreadImmediately:
+         // Both painting and window paint requesting are accessible.
+         if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedPaintable) {
+-          paint_result = PaintAndPresent(false);
++          paint_result = PaintAndPresent(false, true);
+           if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedOutdated) {
+             RequestPaintOrConnectionRecoveryViaWindow(true);
+           }
 @@ -659,7 +688,7 @@ void Presenter::SetGuestOutputPaintConfigFromUIThread(const GuestOutputPaintConf
      modified = true;
      request_repaint = true;
@@ -16666,21 +16816,36 @@ index 7360ed9..dbc6d73 100644
  }
  
  bool Presenter::InSurfaceOnMonitorFromUIThread() const {
-@@ -1497,7 +1587,33 @@ bool Presenter::InSurfaceOnMonitorFromUIThread() const {
- Presenter::PaintResult Presenter::PaintAndPresent(bool execute_ui_drawers) {
-   assert_false(execute_ui_drawers && !is_in_ui_thread_paint_);
+@@ -1494,10 +1584,46 @@ bool Presenter::InSurfaceOnMonitorFromUIThread() const {
+ #endif  // XE_PLATFORM
+ }
+ 
+-Presenter::PaintResult Presenter::PaintAndPresent(bool execute_ui_drawers) {
+-  assert_false(execute_ui_drawers && !is_in_ui_thread_paint_);
++Presenter::PaintResult Presenter::PaintAndPresent(bool execute_ui_drawers,
++                                                  bool from_guest_output_thread) {
++  // The thread is passed explicitly: is_in_ui_thread_paint_ belongs to the UI thread and can't be
++  // read from the guest output thread.
++  assert_false(execute_ui_drawers && from_guest_output_thread);
    assert_true(surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedPaintable);
 +  paint_pacing_ = present_sync::Pacing::kNone;
++  painting_from_guest_output_thread_ = from_guest_output_thread;
    PaintResult result = PaintAndPresentImpl(execute_ui_drawers);
 +  if (result == PaintResult::kPresented || result == PaintResult::kPresentedSuboptimal) {
-+    present_sync::ReportPacing(
-+        is_in_ui_thread_paint_ ? present_sync::Pacing::kNone : paint_pacing_,
-+        paint_pacing_period_);
++    // Painting from the UI thread, new guest frames replace each other in the mailbox instead
++    // of waiting for the present, so the presenter doesn't hold the guest on the vblanks: the
++    // app's limiter does, at the presenter's whole-vblank period.
++    present_sync::Pacing pacing = paint_pacing_;
++    if (!from_guest_output_thread && pacing == present_sync::Pacing::kPresenter) {
++      pacing = present_sync::Pacing::kAppAtDisplayPeriod;
++    }
++    present_sync::ReportPacing(pacing, paint_pacing_period_);
 +  }
 +  if (REXCVAR_GET(present_stats)) {
 +    static std::atomic<uint32_t> ui_with_drawers{0}, ui_without{0}, guest_thread{0};
 +    static std::atomic<int64_t> window_start{0};
-+    (is_in_ui_thread_paint_ ? (execute_ui_drawers ? ui_with_drawers : ui_without) : guest_thread)
++    (!from_guest_output_thread ? (execute_ui_drawers ? ui_with_drawers : ui_without)
++                               : guest_thread)
 +        .fetch_add(1, std::memory_order_relaxed);
 +    const int64_t now = std::chrono::steady_clock::now().time_since_epoch().count();
 +    int64_t start = window_start.load(std::memory_order_relaxed);
@@ -16700,6 +16865,31 @@ index 7360ed9..dbc6d73 100644
    switch (result) {
      case PaintResult::kPresented:
        surface_paint_connection_was_optimal_at_successful_paint_ = true;
+diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
+index b94fe9e..f83e7fe 100644
+--- a/src/ui/rex_app.cpp
++++ b/src/ui/rex_app.cpp
+@@ -439,11 +439,16 @@ void ReXApp::LaunchModule() {
+     if (achievement_notification_ && achievement_notification_listener_ == 0 && runtime_ &&
+         runtime_->kernel_state()) {
+       std::weak_ptr<ui::AchievementNotificationDialog> notification = achievement_notification_;
++      ui::WindowedAppContext* context = &app_context();
+       achievement_notification_listener_ = achievements().RegisterNotificationCallback(
+-          [notification](const rex::system::AchievementEvent& event) {
+-            if (auto dialog = notification.lock()) {
+-              dialog->Push(event);
+-            }
++          [notification, context](const rex::system::AchievementEvent& event) {
++            // Events come from guest threads; the dialog attaches itself to the drawer, which is
++            // owned by the UI thread.
++            context->CallInUIThread([notification, event] {
++              if (auto dialog = notification.lock()) {
++                dialog->Push(event);
++              }
++            });
+           });
+     }
+ 
 diff --git a/src/ui/vulkan/vulkan_device.cpp b/src/ui/vulkan/vulkan_device.cpp
 index 8197bb4..baa36f2 100644
 --- a/src/ui/vulkan/vulkan_device.cpp
@@ -16801,7 +16991,7 @@ index 8197bb4..baa36f2 100644
  
  #undef XE_UI_VULKAN_FUNCTION
 diff --git a/src/ui/vulkan/vulkan_presenter.cpp b/src/ui/vulkan/vulkan_presenter.cpp
-index 23645ef..1825809 100644
+index 23645ef..699b407 100644
 --- a/src/ui/vulkan/vulkan_presenter.cpp
 +++ b/src/ui/vulkan/vulkan_presenter.cpp
 @@ -11,6 +11,7 @@
@@ -17131,10 +17321,10 @@ index 23645ef..1825809 100644
 +  }
 +  g_ffx_vk_get_device_proc_addr.store(vk_device_proc_addr, std::memory_order_relaxed);
 +  backend_desc.vkDeviceProcAddr = FfxVkGetDeviceProcAddrCompat;
- 
--    create_desc.header.pNext = &backend_desc.header;
++
 +  create_desc.header.pNext = &backend_desc.header;
  
+-    create_desc.header.pNext = &backend_desc.header;
 +  ffxContext* context = reinterpret_cast<ffxContext*>(&temporal_upscaler_context_);
 +  if (ffxCreateContext(context, &create_desc.header, nullptr) != FFX_API_RETURN_OK) {
 +    REXLOG_WARN(
@@ -17171,7 +17361,7 @@ index 23645ef..1825809 100644
 +  return false;
 +#endif
 +}
-+
+ 
 +void VulkanPresenter::RecordTemporalUpscale(VkCommandBuffer command_buffer,
 +                                            const TemporalUpscaleParameters& parameters) {
 +  bool upscaled = false;
@@ -17364,7 +17554,7 @@ index 23645ef..1825809 100644
 +      break;
      }
 -    temporal_upscaler_provider_logged_ = true;
-+  }
+   }
 +  // Compose on the game queue: a graphics present queue shares the hardware queue with the
 +  // game, so composing there waits behind the guest's next submission.
 +  ffxCreateContextDescFrameGenerationSwapChainModeVK mode_desc = {};
@@ -17379,9 +17569,8 @@ index 23645ef..1825809 100644
 +    REXLOG_ERROR("VulkanPresenter: Failed to create the FSR 3 frame generation swapchain ({})",
 +                 uint32_t(result));
 +    return false;
-   }
- 
--  return temporal_upscaler_context_ != nullptr;
++  }
++
 +  ffxQueryDescSwapchainReplacementFunctionsVK functions = {};
 +  functions.header.type = FFX_API_QUERY_DESC_TYPE_FGSWAPCHAIN_FUNCTIONS_VK;
 +  ffxQuery(&context, &functions.header);
@@ -17392,16 +17581,9 @@ index 23645ef..1825809 100644
 +  paint_context_.frame_generation_get_present_count = functions.pOutGetLastPresentCountFFXAPI;
 +  REXLOG_INFO("VulkanPresenter: FSR 3 frame generation swapchain created");
 +  return true;
- }
++}
  
--bool VulkanPresenter::DispatchTemporalUpscaler(VkCommandBuffer command_buffer, VkImage input_image,
--                                               uint32_t input_width, uint32_t input_height,
--                                               VkImage output_image, uint32_t output_width,
--                                               uint32_t output_height,
--                                               const GuestOutputPaintConfig& config) {
--  if (command_buffer == VK_NULL_HANDLE || input_image == VK_NULL_HANDLE ||
--      output_image == VK_NULL_HANDLE || !input_width || !input_height || !output_width ||
--      !output_height) {
+-  return temporal_upscaler_context_ != nullptr;
 +void VulkanPresenter::DestroyFrameGenerationContext() {
 +  if (!frame_generation_context_ && frame_generation_depth_ == VK_NULL_HANDLE &&
 +      frame_generation_motion_vectors_ == VK_NULL_HANDLE) {
@@ -17433,8 +17615,16 @@ index 23645ef..1825809 100644
 +  frame_generation_extent_ = {};
 +  frame_generation_max_render_extent_ = {};
 +  frame_generation_format_ = VK_FORMAT_UNDEFINED;
-+}
-+
+ }
+ 
+-bool VulkanPresenter::DispatchTemporalUpscaler(VkCommandBuffer command_buffer, VkImage input_image,
+-                                               uint32_t input_width, uint32_t input_height,
+-                                               VkImage output_image, uint32_t output_width,
+-                                               uint32_t output_height,
+-                                               const GuestOutputPaintConfig& config) {
+-  if (command_buffer == VK_NULL_HANDLE || input_image == VK_NULL_HANDLE ||
+-      output_image == VK_NULL_HANDLE || !input_width || !input_height || !output_width ||
+-      !output_height) {
 +bool VulkanPresenter::EnsureFrameGenerationContext(VkExtent2D render_extent) {
 +  const VkExtent2D extent = paint_context_.swapchain_extent;
 +  const VkFormat format = paint_context_.swapchain_render_pass_format;
@@ -17458,8 +17648,9 @@ index 23645ef..1825809 100644
 +      vulkan_device_->vulkan_instance()->functions().vkGetInstanceProcAddr(
 +          vulkan_device_->vulkan_instance()->instance(), "vkGetDeviceProcAddr"));
 +  if (!vk_device_proc_addr) {
-+    return false;
-+  }
+     return false;
+   }
+-  if (!EnsureTemporalUpscalerContext(input_width, input_height, output_width, output_height)) {
 +  g_ffx_vk_get_device_proc_addr.store(vk_device_proc_addr, std::memory_order_relaxed);
 +  backend_desc.vkDeviceProcAddr = FfxVkGetDeviceProcAddrCompat;
 +
@@ -17479,9 +17670,8 @@ index 23645ef..1825809 100644
 +                       &create_desc.header, nullptr) != FFX_API_RETURN_OK) {
 +    REXLOG_ERROR("VulkanPresenter: Failed to create the FSR 3 frame generation context");
 +    frame_generation_context_ = nullptr;
-     return false;
-   }
--  if (!EnsureTemporalUpscalerContext(input_width, input_height, output_width, output_height)) {
++    return false;
++  }
 +
 +  VkImageCreateInfo image_create_info = {};
 +  image_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
@@ -17518,7 +17708,27 @@ index 23645ef..1825809 100644
 +  frame_generation_stats_ns_ = 0;
 +  return true;
 +}
-+
+ 
+-  VkImageCreateInfo source_image_create_info = {};
+-  source_image_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+-  source_image_create_info.imageType = VK_IMAGE_TYPE_2D;
+-  source_image_create_info.format = kGuestOutputFormat;
+-  source_image_create_info.extent.width = input_width;
+-  source_image_create_info.extent.height = input_height;
+-  source_image_create_info.extent.depth = 1;
+-  source_image_create_info.mipLevels = 1;
+-  source_image_create_info.arrayLayers = 1;
+-  source_image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
+-  source_image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+-  source_image_create_info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+-                                   VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+-  source_image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+-  source_image_create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+-
+-  FfxApiResourceDescription source_desc = ffxApiGetImageResourceDescriptionVK(
+-      input_image, source_image_create_info, FFX_API_RESOURCE_USAGE_READ_ONLY);
+-  FfxApiResource source = ffxApiGetResourceVK(reinterpret_cast<void*>(input_image), source_desc,
+-                                              FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
 +void VulkanPresenter::PrepareFrameGeneration(VkCommandBuffer command_buffer,
 +                                             const GuestOutputImage* guest_output_image,
 +                                             uint64_t paint_submission_index) {
@@ -17666,27 +17876,7 @@ index 23645ef..1825809 100644
 +  if (ffxConfigure(context, &configure_desc.header) != FFX_API_RETURN_OK) {
 +    return;
 +  }
- 
--  VkImageCreateInfo source_image_create_info = {};
--  source_image_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
--  source_image_create_info.imageType = VK_IMAGE_TYPE_2D;
--  source_image_create_info.format = kGuestOutputFormat;
--  source_image_create_info.extent.width = input_width;
--  source_image_create_info.extent.height = input_height;
--  source_image_create_info.extent.depth = 1;
--  source_image_create_info.mipLevels = 1;
--  source_image_create_info.arrayLayers = 1;
--  source_image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
--  source_image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
--  source_image_create_info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
--                                   VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
--  source_image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
--  source_image_create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
--
--  FfxApiResourceDescription source_desc = ffxApiGetImageResourceDescriptionVK(
--      input_image, source_image_create_info, FFX_API_RESOURCE_USAGE_READ_ONLY);
--  FfxApiResource source = ffxApiGetResourceVK(reinterpret_cast<void*>(input_image), source_desc,
--                                              FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
++
 +  const VkExtent2D render_extent =
 +      use_guest_inputs ? guest_output_image->frame_generation_input_extent : extent;
 +  const VkExtent2D input_image_extent = use_guest_inputs ? guest_output_image->extent() : extent;
@@ -18060,7 +18250,7 @@ index 23645ef..1825809 100644
          device, paint_context_.swapchain, &swapchain_image_count,
          swapchain_images_were_empty ? nullptr : paint_context_.swapchain_images.data());
      // If the original swapchain image count was 0 (first call), SUCCESS is
-@@ -1036,11 +1887,108 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
+@@ -1036,11 +1887,141 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
      paint_context_.swapchain_framebuffers.emplace_back(image_view, framebuffer);
    }
  
@@ -18069,15 +18259,23 @@ index 23645ef..1825809 100644
 +      paint_context_.swapchain_present_synchronized && paint_context_.swapchain_is_fifo &&
 +      vulkan_device_->properties().presentId && vulkan_device_->properties().presentWait &&
 +      dfn.vkWaitForPresentKHR;
++  paint_context_.swapchain_present_wait_timeouts = 0;
 +  paint_context_.swapchain_last_present_id = 0;
 +  paint_context_.swapchain_last_present_time = 0.0;
 +  paint_context_.swapchain_vblank_clock.Reset();
 +
 +  // FIFO normally moves painting to the UI thread, so the GPU thread doesn't wait for vblanks.
 +  // Synced for present_sync, that wait is the point: it holds the GPU thread, and through it the
-+  // guest, on the vblanks, where painting from the UI thread would drop frames instead.
++  // guest, on the vblanks, where painting from the UI thread would drop frames instead. The GPU
++  // thread bounds its waits for an image (see PaintAndPresentImpl), but Wayland compositors may
++  // block a FIFO vkQueuePresentKHR itself for as long as the window is hidden, which no timeout
++  // covers, and the GPU thread holds the paint mode lock the UI thread needs while it paints:
++  // there, painting stays on the UI thread, and the app's limiter paces at the display's period.
++  const bool fifo_present_may_block_indefinitely =
++      new_surface.GetType() == Surface::kTypeIndex_WaylandSurface;
 +  is_vsync_implicit_out =
-+      paint_context_.swapchain_is_fifo && !paint_context_.swapchain_present_synchronized;
++      paint_context_.swapchain_is_fifo && (!paint_context_.swapchain_present_synchronized ||
++                                           fifo_present_may_block_indefinitely);
    return SurfacePaintConnectResult::kSuccess;
  }
  
@@ -18101,6 +18299,15 @@ index 23645ef..1825809 100644
 +#endif
 +  const present_sync::Decision sync = present_sync::CurrentDecision();
 +  const double frame_period = sync.interval * sync.refresh_period;
++  if (!IsPaintingFromGuestOutputThread()) {
++    // On the UI thread (UI drawn, or a surface where the GPU thread must not present FIFO), the
++    // presents don't hold the guest, and the UI must not stall on present waits: the app's
++    // limiter runs at whole refreshes, and FIFO keeps the frames on the vblanks.
++    if (sync.paces_target) {
++      SetPaintPacing(present_sync::Pacing::kAppAtDisplayPeriod, frame_period);
++    }
++    return false;
++  }
 +  if (!paint_context.swapchain_present_wait_usable) {
 +    // FIFO shows each frame from the next vblank on, and blocks the thread presenting while all
 +    // the swapchain images are queued: that holds one frame per vblank, but it can't hold a
@@ -18124,19 +18331,35 @@ index 23645ef..1825809 100644
 +        vulkan_device_->device(), paint_context.swapchain,
 +        paint_context.swapchain_last_present_id, uint64_t(timeout * 1e9));
 +    const double wait_end = present_sync::Now();
-+    if (wait_result != VK_SUCCESS && wait_result != VK_SUBOPTIMAL_KHR) {
-+      // A timeout means the window system doesn't report presents (some compositors do not),
-+      // an error that the swapchain is going away. Pace like FIFO without present wait for the
-+      // rest of this swapchain's life.
++    present_sync::VblankClock& vblank_clock = paint_context.swapchain_vblank_clock;
++    // A run of timeouts means the window system doesn't report presents (some compositors do
++    // not); a single one can be a hidden window or a stall. Pace like FIFO without present wait
++    // only after a few, or at once on an error (the swapchain is going away).
++    constexpr uint32_t kMaxPresentWaitTimeouts = 3;
++    if (wait_result == VK_TIMEOUT) {
++      if (++paint_context.swapchain_present_wait_timeouts >= kMaxPresentWaitTimeouts) {
++        REXLOG_WARN(
++            "VulkanPresenter: {} waits for a present timed out in a row, pacing without present "
++            "wait on this swapchain",
++            paint_context.swapchain_present_wait_timeouts);
++        paint_context.swapchain_present_wait_usable = false;
++        return false;
++      }
++      // The vblank times are unknown now: present this frame at once and learn them again.
++      vblank_clock.Reset();
++    } else if (wait_result != VK_SUCCESS && wait_result != VK_SUBOPTIMAL_KHR) {
 +      REXLOG_WARN("VulkanPresenter: Waiting for a present failed ({}), pacing without it",
 +                  int32_t(wait_result));
 +      paint_context.swapchain_present_wait_usable = false;
 +      return false;
++    } else {
++      paint_context.swapchain_present_wait_timeouts = 0;
 +    }
-+    present_sync::VblankClock& vblank_clock = paint_context.swapchain_vblank_clock;
 +    vblank_clock.SetPeriod(sync.refresh_period);
 +    double shown;
-+    if (wait_end - wait_start > 0.0003) {
++    if (wait_result == VK_TIMEOUT) {
++      shown = 0.0;
++    } else if (wait_end - wait_start > 0.0003) {
 +      // The wait ended when the frame was shown: a vblank, just now.
 +      shown = wait_end;
 +      vblank_clock.Anchor(wait_end);
@@ -18144,7 +18367,7 @@ index 23645ef..1825809 100644
 +      // Already shown: on the first vblank after it was queued, as far as the clock knows.
 +      shown = vblank_clock.NextVblankAt(paint_context.swapchain_last_present_time);
 +    }
-+    if (sync.interval > 1) {
++    if (sync.interval > 1 && shown > 0.0) {
 +      // FIFO shows a frame from the first vblank after it's queued, so queue this one just after
 +      // the vblank before the one it's due on, interval - 1 refreshes after the previous frame's.
 +      present_sync::SleepUntil(shown + double(sync.interval - 1) * sync.refresh_period +
@@ -18170,7 +18393,7 @@ index 23645ef..1825809 100644
    paint_context_.DestroySwapchainAndVulkanSurface();
  }
  
-@@ -1073,12 +2021,62 @@ bool VulkanPresenter::RefreshGuestOutputImpl(
+@@ -1073,12 +2054,62 @@ bool VulkanPresenter::RefreshGuestOutputImpl(
      image_instance.SetToNewImage(std::move(new_image), guest_output_image_next_version_++);
    }
  
@@ -18233,7 +18456,7 @@ index 23645ef..1825809 100644
    }
    // Even if the refresher has returned false, it still might have submitted
    // some commands referencing the image. It's better to put an excessive
-@@ -1095,10 +2093,23 @@ bool VulkanPresenter::RefreshGuestOutputImpl(
+@@ -1095,10 +2126,23 @@ bool VulkanPresenter::RefreshGuestOutputImpl(
    {
      VulkanSubmissionTracker::FenceAcquisition fence_acqusition(
          guest_output_image_refresher_submission_tracker_.AcquireFenceToAdvanceSubmission());
@@ -18261,7 +18484,7 @@ index 23645ef..1825809 100644
        fence_acqusition.SubmissionSucceededSignalFailed();
      }
    }
-@@ -1108,8 +2119,10 @@ bool VulkanPresenter::RefreshGuestOutputImpl(
+@@ -1108,8 +2152,10 @@ bool VulkanPresenter::RefreshGuestOutputImpl(
  
  VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
      const VulkanDevice* vulkan_device, VkSurfaceKHR surface, uint32_t width, uint32_t height,
@@ -18274,7 +18497,7 @@ index 23645ef..1825809 100644
    ui_surface_unusable_out = false;
  
    const VulkanInstance::Functions& ifn = vulkan_device->vulkan_instance()->functions();
-@@ -1232,7 +2245,7 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
+@@ -1232,7 +2278,7 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
  #endif
    VkSurfaceFormatKHR image_format;
    if (surface_formats.empty() ||
@@ -18283,7 +18506,7 @@ index 23645ef..1825809 100644
      // Can choose any format if the implementation specifies only UNDEFINED.
      image_format.format = kFormat8888Primary;
      image_format.colorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
-@@ -1381,19 +2394,25 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
+@@ -1381,19 +2427,25 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
    // interfering with GPU command processing, and also to allow tearing so
    // variable refresh rate may be used where it's available.
    // Note: If the priorities here are changes, update the cvar descriptions.
@@ -18312,7 +18535,7 @@ index 23645ef..1825809 100644
               std::find(present_modes.cbegin(), present_modes.cend(),
                         VK_PRESENT_MODE_FIFO_RELAXED_KHR) != present_modes.cend()) {
      // Limiting the frame rate, but lets too long frames cause tearing not to
-@@ -1417,6 +2436,11 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
+@@ -1417,6 +2469,11 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
        uint32_t(swapchain_create_info.imageFormat), uint32_t(swapchain_create_info.imageColorSpace),
        uint32_t(swapchain_create_info.presentMode));
  
@@ -18324,7 +18547,7 @@ index 23645ef..1825809 100644
    present_queue_family_out = queue_family_index_present;
    image_format_out = swapchain_create_info.imageFormat;
    image_extent_out = swapchain_create_info.imageExtent;
-@@ -1445,12 +2469,28 @@ VkSwapchainKHR VulkanPresenter::PaintContext::PrepareForSwapchainRetirement() {
+@@ -1445,12 +2502,28 @@ VkSwapchainKHR VulkanPresenter::PaintContext::PrepareForSwapchainRetirement() {
    return old_swapchain;
  }
  
@@ -18336,7 +18559,7 @@ index 23645ef..1825809 100644
 +void VulkanPresenter::PaintContext::DestroyRetiredSwapchain(VkSwapchainKHR old_swapchain) {
 +  if (old_swapchain == VK_NULL_HANDLE) {
 +    return;
-   }
++  }
 +#if defined(REX_HAS_FIDELITYFX_FRAMEGEN) && REX_HAS_FIDELITYFX_FRAMEGEN
 +  if (frame_generation_swapchain_context) {
 +    // Destroys the frame generation swapchain after its presents.
@@ -18347,7 +18570,7 @@ index 23645ef..1825809 100644
 +    frame_generation_queue_present = nullptr;
 +    frame_generation_get_present_count = nullptr;
 +    return;
-+  }
+   }
 +#endif
 +  vulkan_device->functions().vkDestroySwapchainKHR(vulkan_device->device(), old_swapchain,
 +                                                   nullptr);
@@ -18358,7 +18581,7 @@ index 23645ef..1825809 100644
    present_queue_family = UINT32_MAX;
    if (vulkan_surface != VK_NULL_HANDLE) {
      const VulkanInstance* vulkan_instance = vulkan_device->vulkan_instance();
-@@ -1463,6 +2503,16 @@ void VulkanPresenter::PaintContext::DestroySwapchainAndVulkanSurface() {
+@@ -1463,6 +2536,16 @@ void VulkanPresenter::PaintContext::DestroySwapchainAndVulkanSurface() {
  VulkanPresenter::GuestOutputImage::~GuestOutputImage() {
    const VulkanDevice::Functions& dfn = vulkan_device_->functions();
    const VkDevice device = vulkan_device_->device();
@@ -18375,7 +18598,7 @@ index 23645ef..1825809 100644
    if (view_ != VK_NULL_HANDLE) {
      dfn.vkDestroyImageView(device, view_, nullptr);
    }
-@@ -1474,6 +2524,76 @@ VulkanPresenter::GuestOutputImage::~GuestOutputImage() {
+@@ -1474,6 +2557,76 @@ VulkanPresenter::GuestOutputImage::~GuestOutputImage() {
    }
  }
  
@@ -18452,7 +18675,7 @@ index 23645ef..1825809 100644
  bool VulkanPresenter::GuestOutputImage::Initialize() {
    VkImageCreateInfo image_create_info;
    image_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-@@ -1529,6 +2649,36 @@ bool VulkanPresenter::GuestOutputImage::Initialize() {
+@@ -1529,6 +2682,36 @@ bool VulkanPresenter::GuestOutputImage::Initialize() {
  }
  
  Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_drawers) {
@@ -18489,25 +18712,42 @@ index 23645ef..1825809 100644
    // Begin the submission in place of the one not currently potentially used on
    // the GPU.
    uint64_t current_paint_submission_index =
-@@ -1569,9 +2719,15 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+@@ -1569,13 +2752,31 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
  
    VkSemaphore acquire_semaphore = paint_submission.acquire_semaphore();
    uint32_t swapchain_image_index;
+-  VkResult acquire_result =
+-      dfn.vkAcquireNextImageKHR(device, paint_context_.swapchain, UINT64_MAX, acquire_semaphore,
+-                                VK_NULL_HANDLE, &swapchain_image_index);
 +  PFN_vkAcquireNextImageKHR acquire_next_image = dfn.vkAcquireNextImageKHR;
 +#if defined(REX_HAS_FIDELITYFX_FRAMEGEN) && REX_HAS_FIDELITYFX_FRAMEGEN
 +  if (paint_context_.frame_generation_acquire_next_image) {
 +    acquire_next_image = paint_context_.frame_generation_acquire_next_image;
 +  }
 +#endif
-   VkResult acquire_result =
--      dfn.vkAcquireNextImageKHR(device, paint_context_.swapchain, UINT64_MAX, acquire_semaphore,
--                                VK_NULL_HANDLE, &swapchain_image_index);
-+      acquire_next_image(device, paint_context_.swapchain, UINT64_MAX, acquire_semaphore,
-+                         VK_NULL_HANDLE, &swapchain_image_index);
++  // Synced FIFO painted from the GPU thread: that thread holds the paint mode lock, which the UI
++  // thread takes to change the paint mode, so it must not wait for an image forever (FIFO may
++  // not release one while the window is hidden or minimized on some drivers). After 100 ms
++  // the frame is dropped; the next guest frame tries again.
++  const bool bounded_acquire = IsPaintingFromGuestOutputThread() &&
++                               paint_context_.swapchain_present_synchronized &&
++                               paint_context_.swapchain_is_fifo;
++  VkResult acquire_result = acquire_next_image(
++      device, paint_context_.swapchain, bounded_acquire ? uint64_t(100000000) : UINT64_MAX,
++      acquire_semaphore, VK_NULL_HANDLE, &swapchain_image_index);
    switch (acquire_result) {
      case VK_SUCCESS:
      case VK_SUBOPTIMAL_KHR:
-@@ -1648,10 +2804,44 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+       break;
++    case VK_TIMEOUT:
++    case VK_NOT_READY:
++      // No image within the bound (the acquire semaphore isn't signaled then, so it can be
++      // used again). Not an error.
++      return PaintResult::kNotPresented;
+     case VK_ERROR_DEVICE_LOST:
+       REXLOG_ERROR(
+           "VulkanPresenter: Failed to acquire the swapchain image as the "
+@@ -1648,10 +2849,44 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
    if (guest_output_image) {
      VkExtent2D max_framebuffer_extent =
          util::GetMax2DFramebufferExtent(vulkan_device_->properties());
@@ -18552,7 +18792,7 @@ index 23645ef..1825809 100644
      if (guest_output_flow.effect_count) {
        // Store the main target reference to the guest output image so it's not
        // destroyed while it's still potentially in use by main target painting
-@@ -1840,6 +3030,10 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+@@ -1840,6 +3075,10 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
                  swapchain_effect, paint_context_.swapchain_render_pass);
              if (swapchain_effect_pipeline.swapchain_pipeline == VK_NULL_HANDLE) {
                guest_output_flow.effect_count = 0;
@@ -18563,7 +18803,7 @@ index 23645ef..1825809 100644
              }
            }
          }
-@@ -1862,12 +3056,6 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+@@ -1862,12 +3101,6 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
            paint_context_.guest_output_intermediate_image_last_submission =
                current_paint_submission_index;
          }
@@ -18576,7 +18816,7 @@ index 23645ef..1825809 100644
          for (size_t i = 0; i < guest_output_flow.effect_count; ++i) {
            bool is_final_effect = i + 1 >= guest_output_flow.effect_count;
            GuestOutputPaintEffect effect = guest_output_flow.effects[i];
-@@ -1894,61 +3082,6 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+@@ -1894,61 +3127,6 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
              guest_output_flow.output_y = 0;
              guest_output_flow.letterbox_clear_rectangle_count = 0;
            }
@@ -18638,7 +18878,7 @@ index 23645ef..1825809 100644
            int32_t effect_rect_x, effect_rect_y;
            if (is_final_effect) {
              effect_rect_x = guest_output_flow.output_x;
-@@ -2027,7 +3160,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+@@ -2027,7 +3205,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
            uint32_t effect_constants_size = 0;
            union {
              BilinearConstants bilinear;
@@ -18647,7 +18887,7 @@ index 23645ef..1825809 100644
              CasSharpenConstants cas_sharpen;
              CasResampleConstants cas_resample;
              FsrEasuConstants fsr_easu;
-@@ -2039,7 +3172,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+@@ -2039,7 +3217,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
                effect_constants_size = sizeof(effect_constants.bilinear);
                effect_constants.bilinear.Initialize(guest_output_flow, i);
              } break;
@@ -18656,7 +18896,7 @@ index 23645ef..1825809 100644
              case kGuestOutputPaintPipelineLayoutIndexCasSharpen: {
                effect_constants_size = sizeof(effect_constants.cas_sharpen);
                effect_constants.cas_sharpen.Initialize(guest_output_flow, i,
-@@ -2070,6 +3203,22 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+@@ -2070,6 +3248,22 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
  
            dfn.vkCmdDraw(draw_command_buffer, 4, 1, 0, 0);
  
@@ -18679,7 +18919,7 @@ index 23645ef..1825809 100644
            if (is_final_effect) {
              // Clear the letterbox around the guest output if the guest output
              // doesn't cover the entire swapchain image.
-@@ -2153,6 +3302,13 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+@@ -2153,6 +3347,13 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
  
    dfn.vkCmdEndRenderPass(draw_command_buffer);
  
@@ -18693,7 +18933,7 @@ index 23645ef..1825809 100644
    dfn.vkEndCommandBuffer(draw_command_buffer);
  
    VkPipelineStageFlags acquire_semaphore_wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-@@ -2227,9 +3383,11 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+@@ -2227,9 +3428,11 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
      }
    }
  
@@ -18706,7 +18946,7 @@ index 23645ef..1825809 100644
    present_info.waitSemaphoreCount = 1;
    present_info.pWaitSemaphores = &present_semaphore;
    present_info.swapchainCount = 1;
-@@ -2237,6 +3395,15 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+@@ -2237,6 +3440,15 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
    present_info.pImageIndices = &swapchain_image_index;
    present_info.pResults = nullptr;
    VkResult present_result;
@@ -18722,7 +18962,7 @@ index 23645ef..1825809 100644
    {
      const VulkanDevice::Queue::Acquisition queue_acquisition =
          vulkan_device_->AcquireQueue(paint_context_.present_queue_family, 0);
-@@ -2334,7 +3501,7 @@ bool VulkanPresenter::InitializeSurfaceIndependent() {
+@@ -2334,7 +3546,7 @@ bool VulkanPresenter::InitializeSurfaceIndependent() {
        case kGuestOutputPaintPipelineLayoutIndexBilinear:
          guest_output_paint_push_constant_range_ffx.size = sizeof(BilinearConstants);
          break;
@@ -18731,7 +18971,7 @@ index 23645ef..1825809 100644
        case kGuestOutputPaintPipelineLayoutIndexCasSharpen:
          guest_output_paint_push_constant_range_ffx.size = sizeof(CasSharpenConstants);
          break;
-@@ -2389,7 +3556,7 @@ bool VulkanPresenter::InitializeSurfaceIndependent() {
+@@ -2389,7 +3601,7 @@ bool VulkanPresenter::InitializeSurfaceIndependent() {
          shader_module_create_info.codeSize = sizeof(shaders::guest_output_bilinear_dither_ps);
          shader_module_create_info.pCode = shaders::guest_output_bilinear_dither_ps;
          break;

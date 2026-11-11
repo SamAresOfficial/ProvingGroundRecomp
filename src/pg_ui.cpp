@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -89,24 +90,37 @@ uint32_t g_window_physical_height = 720;
 
 // Height of the screen the game is shown on.
 uint32_t DisplayHeight() {
-#if REX_PLATFORM_WIN32
   if (rex::cvar::Query<bool>("fullscreen")) {
-    // The desktop mode of the primary monitor, in physical pixels whatever the DPI scale. The
-    // menus ask on every frame, and the query goes to the display driver, so it is kept for a
-    // second (a mode change shows up within that).
+    // The desktop mode of the monitor the game opens on (the monitor setting, as the window
+    // picks it; 0 is the system's main one), in physical pixels whatever the DPI scale. It is
+    // known before the window exists (the launcher) and doesn't depend on the window's size,
+    // which lags a switch to fullscreen. The menus ask on every frame, so it is kept for a second
+    // (a mode change shows up within that).
     static uint32_t cached_height = 0;
-    static uint64_t cached_at = 0;
-    const uint64_t now = GetTickCount64();
-    if (!cached_height || now - cached_at >= 1000) {
-      DEVMODEW mode = {};
-      mode.dmSize = sizeof(mode);
-      cached_height =
-          EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &mode) ? mode.dmPelsHeight : 0;
+    static int32_t cached_monitor = -1;
+    static auto cached_at = std::chrono::steady_clock::time_point{};
+    const int32_t monitor = rex::cvar::Query<int32_t>("monitor");
+    const auto now = std::chrono::steady_clock::now();
+    if (!cached_height || monitor != cached_monitor || now - cached_at >= std::chrono::seconds(1)) {
+      cached_height = 0;
+      if (SDL_InitSubSystem(SDL_INIT_VIDEO)) {
+        int count = 0;
+        if (SDL_DisplayID* displays = SDL_GetDisplays(&count)) {
+          SDL_DisplayID display = SDL_GetPrimaryDisplay();
+          if (monitor >= 1 && monitor <= count) display = displays[monitor - 1];
+          if (const SDL_DisplayMode* desktop = SDL_GetDesktopDisplayMode(display)) {
+            const float density = desktop->pixel_density > 0.0f ? desktop->pixel_density : 1.0f;
+            cached_height = uint32_t(std::lround(desktop->h * density));
+          }
+          SDL_free(displays);
+        }
+        SDL_QuitSubSystem(SDL_INIT_VIDEO);
+      }
+      cached_monitor = monitor;
       cached_at = now;
     }
     if (cached_height) return cached_height;
   }
-#endif
   return std::max<uint32_t>(g_window_physical_height, 1);
 }
 
@@ -2020,6 +2034,10 @@ void GameMenu::OnDraw(ImGuiIO& io) {
 }
 
 // --- FPS readout ---
+
+FpsOverlay::FpsOverlay(rex::ui::ImGuiDrawer* drawer) : ImGuiDialog(drawer, false) { Refresh(); }
+
+void FpsOverlay::Refresh() { SetAttached(REXCVAR_GET(show_fps)); }
 
 void FpsOverlay::OnDraw(ImGuiIO& io) {
   if (!REXCVAR_GET(show_fps)) return;

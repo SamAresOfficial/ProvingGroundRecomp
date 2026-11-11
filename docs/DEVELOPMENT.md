@@ -70,9 +70,10 @@ the scan-out (a 60 FPS timer on a 59.94 Hz panel slips a frame every 17 s). `pre
   re-read when the window changes monitor and on SDL display mode events, and logged
   (`Presenter: display refresh rate ...`).
 - D3D12: the swap chain is created with `FRAME_LATENCY_WAITABLE_OBJECT` (and tearing where
-  supported) and is never recreated for this. Synced, `Present(refresh / limit, 0)` with a
-  maximum frame latency of 1, waiting on the waitable object before painting; unsynced as
-  before, with a latency of 3 (the old default).
+  supported) and a fixed maximum frame latency of 1, and is never recreated for this (the
+  waitable object is a counting semaphore, so the latency can't be lowered at run time). Before
+  painting, the presenter waits on it for at most 100 ms; presents made after a timeout are
+  taken back from later waits. Synced, `Present(refresh / limit, 0)`; unsynced as before.
 - Vulkan: the present mode is fixed at swapchain creation, so a change (the setting, the limit
   or the display) makes `PaintAndPresentImpl` report the connection as outdated, and the UI
   thread recreates the swapchain on the existing reconnect path. Synced uses FIFO, painted from
@@ -81,13 +82,24 @@ the scan-out (a 60 FPS timer on a 59.94 Hz panel slips a frame every 17 s). `pre
   `VK_KHR_present_wait` the presenter waits for the previous frame to reach the screen (one frame
   queued at most), takes that as the vblank, and queues the next frame just after the vblank
   before the one it's due on. Without present wait, FIFO paces 1 vblank per frame by itself, and
-  for more the game's timer runs at whole refreshes of the measured rate.
+  for more the game's timer runs at whole refreshes of the measured rate. A present wait that
+  times out drops the vblank estimate for that frame; three in a row, or an error, turn present
+  wait off for the swapchain (logged).
+- The GPU thread holds the paint mode lock while it presents, so it must not block forever: it
+  acquires a FIFO image with a 100 ms timeout and drops the frame on a timeout. Wayland can block
+  a FIFO `vkQueuePresentKHR` itself while the window is hidden, so on Wayland synced painting
+  stays on the UI thread and the game's timer paces at the display period.
 - FSR 3 frame generation keeps choosing its own present mode (FIFO with
   `fsr3_frame_generation_vsync`); `present_sync` doesn't apply while it is on.
-- The presenter reports how it paces (`rex::ui::present_sync::GetPacing`) after each present
-  from the GPU thread. When it holds frames on the vblanks, `LimitFrameRate` steps aside instead
-  of waiting a second time; the report lapses after 100 ms without presents (minimized), or
-  while the UI thread paints (Insert menu), and the timer takes over.
+- The presenter reports how it paces (`rex::ui::present_sync::GetPacing`) after each present.
+  When it holds frames on the vblanks (only from the GPU thread), `LimitFrameRate` steps aside
+  instead of waiting a second time; the report lapses after 100 ms without presents (minimized),
+  and while the UI thread paints the timer runs at the presenter's whole-vblank period.
+- The GPU thread presents only while no UI drawer is registered with the presenter; any
+  `ImGuiDialog` attached to the drawer moves all painting to the UI thread's paint events. So
+  passive overlays attach only while they show something (`ImGuiDialog::SetAttached`): the FPS
+  counter while `show_fps` is on, the achievement toast while a toast is queued. The launcher,
+  the Insert menu and the developer overlays exist only while open.
 
 ### Cutscene camera clock
 
