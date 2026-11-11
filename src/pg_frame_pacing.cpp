@@ -30,14 +30,23 @@
 #if REX_PLATFORM_WIN32
 #include <windows.h>
 #endif
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#include <immintrin.h>
+#define PG_CPU_RELAX() _mm_pause()
+#else
+#define PG_CPU_RELAX() std::this_thread::yield()
+#endif
 
 REXCVAR_DEFINE_BOOL(uncapped_real_time, true, "GPU",
                     "Without vsync, don't wait for vblanks in the game, and advance its vblank "
                     "counter at the real 60 Hz so cutscenes run at the right speed")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_INT32(frame_rate_limit, 60, "Video",
-                     "Frame rate limit: 30 is the original vsync pacing, 0 is unlimited")
-    // 40 and 90 divide 120 Hz screens (handhelds such as the ROG Xbox Ally) evenly.
+                     "Frame rate limit, held by a timer: 30 is the console's rate (paced by "
+                     "60 Hz guest vblanks), 0 is unlimited. Frames are presented without "
+                     "vsync, so use a variable refresh rate display to avoid tearing")
+    // 40 and 90 are whole fractions of 120 Hz screens (handhelds such as the ROG Xbox Ally);
+    // the timer is not locked to the display's scan-out, so without VRR they still tear.
     .allowed({"0", "30", "40", "60", "90", "120", "144", "165", "240"});
 REXCVAR_DEFINE_BOOL(swap_waits_for_new_frame, true, "Video",
                     "After a swap, the render thread waits for the game's next frame instead of "
@@ -101,25 +110,36 @@ void CountFrame(Clock::time_point now) {
 }
 
 // Sleeps until the deadline: a high-resolution timer for most of the wait, then a short spin,
-// as a plain sleep can overshoot by a millisecond or more.
+// as a plain sleep can overshoot by a millisecond or more. High-resolution timers wake within
+// about 50-100 us, so the spin is kept short: it holds a core busy and out of its sleep states.
 void WaitUntil(Clock::time_point deadline) {
-  constexpr auto kSpin = std::chrono::microseconds(500);
+  constexpr auto kSpin = std::chrono::microseconds(200);
 #if REX_PLATFORM_WIN32
-  static thread_local HANDLE timer = CreateWaitableTimerExW(
-      nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+  struct Timer {
+    HANDLE handle = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                           TIMER_ALL_ACCESS);
+    ~Timer() {
+      if (handle) CloseHandle(handle);
+    }
+  };
+  static thread_local Timer timer;
   const auto sleep = deadline - kSpin - Clock::now();
-  if (timer && sleep > std::chrono::microseconds(0)) {
+  if (sleep > std::chrono::microseconds(0)) {
     LARGE_INTEGER due;
     due.QuadPart = -std::chrono::duration_cast<std::chrono::nanoseconds>(sleep).count() / 100;
-    if (SetWaitableTimerEx(timer, &due, 0, nullptr, nullptr, nullptr, 0)) {
-      WaitForSingleObject(timer, INFINITE);
+    if (timer.handle && SetWaitableTimerEx(timer.handle, &due, 0, nullptr, nullptr, nullptr, 0)) {
+      WaitForSingleObject(timer.handle, INFINITE);
+    } else if (sleep >= std::chrono::milliseconds(2)) {
+      // No high-resolution timer (Windows 10 before 1803, some Wine builds): Sleep, which can
+      // wake up to a timer period late, for all but the last millisecond and a bit.
+      ::Sleep(DWORD(std::chrono::duration_cast<std::chrono::milliseconds>(sleep).count() - 1));
     }
   }
 #else
   std::this_thread::sleep_until(deadline - kSpin);
 #endif
   while (Clock::now() < deadline) {
-    std::this_thread::yield();
+    PG_CPU_RELAX();
   }
 }
 

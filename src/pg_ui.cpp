@@ -89,15 +89,31 @@ uint32_t g_window_physical_height = 720;
 uint32_t DisplayHeight() {
 #if REX_PLATFORM_WIN32
   if (rex::cvar::Query<bool>("fullscreen")) {
-    // The desktop mode of the primary monitor, in physical pixels whatever the DPI scale.
-    DEVMODEW mode = {};
-    mode.dmSize = sizeof(mode);
-    if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &mode) && mode.dmPelsHeight) {
-      return mode.dmPelsHeight;
+    // The desktop mode of the primary monitor, in physical pixels whatever the DPI scale. The
+    // menus ask on every frame, and the query goes to the display driver, so it is kept for a
+    // second (a mode change shows up within that).
+    static uint32_t cached_height = 0;
+    static uint64_t cached_at = 0;
+    const uint64_t now = GetTickCount64();
+    if (!cached_height || now - cached_at >= 1000) {
+      DEVMODEW mode = {};
+      mode.dmSize = sizeof(mode);
+      cached_height =
+          EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &mode) ? mode.dmPelsHeight : 0;
+      cached_at = now;
     }
+    if (cached_height) return cached_height;
   }
 #endif
   return std::max<uint32_t>(g_window_physical_height, 1);
+}
+
+// Enter and Start start the game from anywhere on the launcher, unless they are doing something
+// else: activating the item keyboard or gamepad navigation is on, or choosing in an open list.
+bool PlayShortcutFree() {
+  const ImGuiIO& io = ImGui::GetIO();
+  return !io.WantTextInput && !ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId) &&
+         !ImGui::IsAnyItemActive() && !(io.NavVisible && ImGui::IsAnyItemFocused());
 }
 
 // FSR 3.1 runs on Vulkan with the FidelityFX runtime the presenter is built with.
@@ -351,7 +367,14 @@ void SaveSettings(const std::filesystem::path& config_path) {
   // Keep any other lines the user added, replacing only the settings written here.
   std::vector<std::string> kept;
   {
+    std::error_code ec;
+    const bool exists = std::filesystem::exists(config_path, ec);
     std::ifstream in(config_path);
+    if (exists && !in) {
+      // Writing now would drop the user's own lines.
+      REXLOG_WARN("Could not read {}; settings not saved", rex::path_to_utf8(config_path));
+      return;
+    }
     std::string line;
     while (std::getline(in, line)) {
       const auto key_end = line.find_first_of(" =");
@@ -366,9 +389,13 @@ void SaveSettings(const std::filesystem::path& config_path) {
       if (!ours && line.rfind("# Proving Ground settings", 0) != 0) kept.push_back(line);
     }
   }
-  std::ofstream out(config_path, std::ios::trunc);
+  // Written next to the file and moved over it, so a crash or a full disk never leaves a
+  // truncated pg.toml.
+  std::filesystem::path temp_path = config_path;
+  temp_path += ".tmp";
+  std::ofstream out(temp_path, std::ios::trunc);
   if (!out) {
-    REXLOG_WARN("Could not save settings to {}", rex::path_to_utf8(config_path));
+    REXLOG_WARN("Could not save settings to {}", rex::path_to_utf8(temp_path));
     return;
   }
   out << "# Proving Ground settings (written by the launcher and the Insert menu)\n";
@@ -392,6 +419,19 @@ void SaveSettings(const std::filesystem::path& config_path) {
         << (entry.type == rex::cvar::FlagType::String ? TomlString(value) : value) << "\n";
   }
   for (const auto& line : kept) out << line << "\n";
+  out.close();
+  std::error_code ec;
+  if (!out) {
+    REXLOG_WARN("Could not write settings to {}", rex::path_to_utf8(temp_path));
+    std::filesystem::remove(temp_path, ec);
+    return;
+  }
+  // Replaces the old file atomically (MoveFileExW with MOVEFILE_REPLACE_EXISTING on Windows).
+  std::filesystem::rename(temp_path, config_path, ec);
+  if (ec) {
+    REXLOG_WARN("Could not replace {}: {}", rex::path_to_utf8(config_path), ec.message());
+    std::filesystem::remove(temp_path, ec);
+  }
 }
 
 void ApplyStartupSettings() {
@@ -470,21 +510,47 @@ void ApplyUpscaler() {
 
 const char* RequiredRenderer() { return REXCVAR_GET(renderer) == "d3d12" ? "d3d12" : "vulkan"; }
 
+#if REX_PLATFORM_WIN32
+// Quotes one argument the way CommandLineToArgvW and the C runtime read it back: backslashes
+// are literal unless they come before a quote, where each one must be doubled.
+std::wstring QuoteArgument(const std::wstring& arg) {
+  std::wstring out = L"\"";
+  size_t backslashes = 0;
+  for (wchar_t c : arg) {
+    if (c == L'\\') {
+      ++backslashes;
+      continue;
+    }
+    if (c == L'"') {
+      out.append(backslashes * 2 + 1, L'\\');
+    } else {
+      out.append(backslashes, L'\\');
+    }
+    backslashes = 0;
+    out += c;
+  }
+  // Before the closing quote, too (a folder such as E:\).
+  out.append(backslashes * 2, L'\\');
+  out += L'"';
+  return out;
+}
+#endif
+
 bool Relaunch(const std::filesystem::path& game_folder) {
 #if REX_PLATFORM_WIN32
   // The same command line, with the game folder so the new process skips the launcher.
   const std::filesystem::path exe = rex::filesystem::GetExecutablePath();
-  std::wstring command = L"\"" + exe.wstring() + L"\"";
+  std::wstring command = QuoteArgument(exe.wstring());
   int argc = 0;
   if (wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc)) {
     for (int i = 1; i < argc; ++i) {
       const std::wstring arg = argv[i];
       if (arg.starts_with(L"--launcher") || arg.starts_with(L"--game_data_root")) continue;
-      command += L" \"" + arg + L"\"";
+      command += L" " + QuoteArgument(arg);
     }
     LocalFree(argv);
   }
-  command += L" \"--game_data_root=" + game_folder.wstring() + L"\"";
+  command += L" " + QuoteArgument(L"--game_data_root=" + game_folder.wstring());
   STARTUPINFOW startup = {};
   startup.cb = sizeof(startup);
   PROCESS_INFORMATION process = {};
@@ -1543,7 +1609,7 @@ bool DrawLauncher(LauncherState& state) {
   if (!can_play && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
     ImGui::SetTooltip("Choose the game folder first.");
   }
-  if (can_play && !io.WantTextInput && state.capturing.empty() &&
+  if (can_play && state.capturing.empty() && PlayShortcutFree() &&
       (ImGui::IsKeyPressed(ImGuiKey_Enter, false) ||
        ImGui::IsKeyPressed(ImGuiKey_GamepadStart, false))) {
     play_pressed = true;
@@ -1708,7 +1774,7 @@ void Launcher::OnDraw(ImGuiIO& io) {
   const float play_width =
       ImGui::GetContentRegionAvail().x - quit_width - ImGui::GetStyle().ItemSpacing.x;
   bool play = ui::AccentButton("PLAY", ImVec2(play_width, 46 * s), can_play);
-  if (can_play && !io.WantTextInput && ImGui::IsKeyPressed(ImGuiKey_Enter, false)) play = true;
+  if (can_play && PlayShortcutFree() && ImGui::IsKeyPressed(ImGuiKey_Enter, false)) play = true;
   ImGui::SameLine();
   if (ImGui::Button("Quit", ImVec2(quit_width, 46 * s))) {
     ImGui::End();

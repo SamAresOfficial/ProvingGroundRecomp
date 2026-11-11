@@ -41,10 +41,11 @@ else
     SDK="$REPO/thirdparty/rexglue-sdk"
     if [[ ! -f "$SDK/CMakeLists.txt" ]]; then
         step sdk-clone git clone --branch "$SDK_TAG" --depth 1 "$SDK_URL" "$SDK"
-        step sdk-submodules git -C "$SDK" submodule update --init --recursive --depth 1 --jobs 8
     fi
     PATCH_HASH="$(sha256sum "$PATCH" | cut -d' ' -f1)"
     if [[ ! -f "$SDK/.pg-patch" ]]; then
+        # Until the tree is patched, so a submodule fetch that failed part way is completed.
+        step sdk-submodules git -C "$SDK" submodule update --init --recursive --depth 1 --jobs 8
         step sdk-patch git -C "$SDK" apply --whitespace=nowarn "$PATCH"
         echo "$PATCH_HASH" > "$SDK/.pg-patch"
     elif [[ "$(cat "$SDK/.pg-patch")" != "$PATCH_HASH" ]]; then

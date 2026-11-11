@@ -70,9 +70,100 @@ std::string ThreadName(HANDLE thread) {
   return name;
 }
 
-// Unwinds a suspended thread's stack. Must not allocate: the thread may hold the
-// heap lock.
-int CaptureStack(HANDLE thread, uint64_t* frames) {
+// The unwind tables of the loaded modules, read from their PE headers while no thread is
+// suspended. RtlLookupFunctionEntry can't be used on a suspended thread: it takes ntdll's
+// function table locks, and a thread suspended while holding them (loading a DLL, or a driver
+// registering JIT code) would never be resumed, freezing the game. Code without a table here
+// (dynamic function tables) is unwound as a leaf.
+class UnwindTables {
+ public:
+  ~UnwindTables() { Release(); }
+
+  void Refresh() {
+    Release();
+    HANDLE process = GetCurrentProcess();
+    std::vector<HMODULE> modules(256);
+    DWORD needed = 0;
+    while (EnumProcessModules(process, modules.data(), DWORD(modules.size() * sizeof(HMODULE)),
+                              &needed) &&
+           needed > modules.size() * sizeof(HMODULE)) {
+      modules.resize(needed / sizeof(HMODULE));
+    }
+    modules.resize(std::min<size_t>(modules.size(), needed / sizeof(HMODULE)));
+    for (HMODULE module : modules) {
+      // Hold a reference, so the module can't be unloaded while its table is in use.
+      HMODULE held = nullptr;
+      if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                              reinterpret_cast<LPCWSTR>(module), &held)) {
+        continue;
+      }
+      const auto* base = reinterpret_cast<const uint8_t*>(held);
+      const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+      const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+      if (dos->e_magic != IMAGE_DOS_SIGNATURE || nt->Signature != IMAGE_NT_SIGNATURE ||
+          nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+        FreeLibrary(held);
+        continue;
+      }
+      const IMAGE_DATA_DIRECTORY& dir =
+          nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+      Image image;
+      image.begin = reinterpret_cast<uint64_t>(base);
+      image.end = image.begin + nt->OptionalHeader.SizeOfImage;
+      image.held = held;
+      if (dir.VirtualAddress && dir.Size >= sizeof(RUNTIME_FUNCTION)) {
+        image.table = reinterpret_cast<const RUNTIME_FUNCTION*>(base + dir.VirtualAddress);
+        image.count = dir.Size / sizeof(RUNTIME_FUNCTION);
+      }
+      images_.push_back(image);
+    }
+    std::sort(images_.begin(), images_.end(),
+              [](const Image& a, const Image& b) { return a.begin < b.begin; });
+  }
+
+  // Lock-free and allocation-free: safe while another thread is suspended.
+  PRUNTIME_FUNCTION Lookup(uint64_t address, DWORD64* image_base) const {
+    auto it = std::upper_bound(images_.begin(), images_.end(), address,
+                               [](uint64_t a, const Image& image) { return a < image.begin; });
+    if (it == images_.begin()) return nullptr;
+    const Image& image = *--it;
+    if (address >= image.end || !image.table) return nullptr;
+    const DWORD rva = DWORD(address - image.begin);
+    size_t low = 0, high = image.count;
+    while (low < high) {
+      const size_t mid = (low + high) / 2;
+      const RUNTIME_FUNCTION& entry = image.table[mid];
+      if (rva < entry.BeginAddress) {
+        high = mid;
+      } else if (rva >= entry.EndAddress) {
+        low = mid + 1;
+      } else {
+        *image_base = image.begin;
+        return const_cast<PRUNTIME_FUNCTION>(&entry);
+      }
+    }
+    return nullptr;
+  }
+
+ private:
+  struct Image {
+    uint64_t begin = 0, end = 0;
+    const RUNTIME_FUNCTION* table = nullptr;
+    DWORD count = 0;
+    HMODULE held = nullptr;
+  };
+
+  void Release() {
+    for (const Image& image : images_) FreeLibrary(image.held);
+    images_.clear();
+  }
+
+  std::vector<Image> images_;
+};
+
+// Unwinds a suspended thread's stack. Must not allocate or take locks: the thread may hold the
+// heap lock or the loader's.
+int CaptureStack(HANDLE thread, const UnwindTables& tables, uint64_t* frames) {
   CONTEXT context = {};
   context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
   if (!GetThreadContext(thread, &context)) return 0;
@@ -80,7 +171,7 @@ int CaptureStack(HANDLE thread, uint64_t* frames) {
   while (count < kMaxFrames && context.Rip) {
     frames[count++] = context.Rip;
     DWORD64 image_base = 0;
-    PRUNTIME_FUNCTION function = RtlLookupFunctionEntry(context.Rip, &image_base, nullptr);
+    PRUNTIME_FUNCTION function = tables.Lookup(context.Rip, &image_base);
     if (!function) {
       // Leaf function without unwind data: the return address is on top of the stack.
       DWORD64 return_address = 0;
@@ -129,6 +220,7 @@ PgSampler::PgSampler(std::string report_path, uint32_t period_ms)
       HANDLE handle;
     };
     std::vector<Target> targets;
+    UnwindTables unwind_tables;
     ULONGLONG last_enumeration = 0;
     uint64_t frames[kMaxFrames];
     const std::vector<ModuleRange> system_modules = SystemModules();
@@ -145,6 +237,7 @@ PgSampler::PgSampler(std::string report_path, uint32_t period_ms)
       ULONGLONG now = GetTickCount64();
       if (now - last_enumeration > 500) {
         last_enumeration = now;
+        unwind_tables.Refresh();
         for (auto& target : targets) CloseHandle(target.handle);
         targets.clear();
         HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
@@ -162,7 +255,7 @@ PgSampler::PgSampler(std::string report_path, uint32_t period_ms)
       }
       for (const Target& target : targets) {
         if (SuspendThread(target.handle) == DWORD(-1)) continue;
-        int count = CaptureStack(target.handle, frames);
+        int count = CaptureStack(target.handle, unwind_tables, frames);
         ResumeThread(target.handle);
         if (!count) continue;
         std::lock_guard lock(state->mutex);

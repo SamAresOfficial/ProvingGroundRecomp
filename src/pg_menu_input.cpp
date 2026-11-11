@@ -8,7 +8,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <utility>
 
@@ -27,23 +29,32 @@ constexpr uint16_t kDpadUp = 0x0001, kDpadDown = 0x0002, kDpadLeft = 0x0004,
                    kA = 0x1000, kB = 0x2000, kX = 0x4000, kY = 0x8000;
 constexpr uint16_t kCombo = kBack | kStart;
 constexpr uint32_t kUsers = 4;
+// A user the game has not polled for this long has no controller any more (the SDK only runs
+// the filter for users with a device), so their last state is stale.
+constexpr auto kStale = std::chrono::milliseconds(500);
+
+using Clock = std::chrono::steady_clock;
 
 struct User {
   // Buttons at the previous poll, for presses.
   uint16_t previous = 0;
-  // The game currently sees an untouched controller.
-  bool hidden = false;
   // Hidden after the menu opened or closed until every button is up, so the buttons that
   // opened or closed it never reach the game.
   bool wait_release = false;
-  // Added to the packet number, bumped whenever hidden changes: games skip states whose packet
-  // number did not change, and a stick held through the change would otherwise be missed.
-  uint32_t packet_offset = 0;
+  // The packet number the game sees, bumped whenever the state it sees changes. Games skip
+  // states whose packet number did not change. The merged packet number of several devices
+  // (the larger one) can stay the same while one of them changes, and hiding the controller
+  // must count as a change too, or a stick held through it would be missed.
+  uint32_t packet = 0;
+  rex::input::X_INPUT_GAMEPAD reported = {};
   // The last real state, for the menu.
   uint16_t buttons = 0;
   uint8_t left_trigger = 0, right_trigger = 0;
   int16_t thumb_lx = 0, thumb_ly = 0;
   bool seen = false;
+  Clock::time_point last_poll;
+
+  bool Fresh(Clock::time_point now) const { return seen && now - last_poll < kStale; }
 };
 
 std::mutex g_mutex;
@@ -52,8 +63,25 @@ std::array<User, kUsers> g_users;
 bool g_menu_wanted = false;
 std::function<void(bool)> g_request_menu;
 
+// Only users with a controller: the flag is cleared when the game polls them with every button
+// up, and users without a device are never polled.
 void WaitForReleaseLocked() {
-  for (auto& user : g_users) user.wait_release = true;
+  const auto now = Clock::now();
+  for (auto& user : g_users) user.wait_release = user.Fresh(now);
+}
+
+// Forgets the controllers that went away (UI or input thread, under the lock).
+void ForgetStaleLocked(Clock::time_point now) {
+  for (auto& user : g_users) {
+    if (user.seen && !user.Fresh(now)) {
+      user.seen = false;
+      user.wait_release = false;
+      user.previous = 0;
+      user.buttons = 0;
+      user.left_trigger = user.right_trigger = 0;
+      user.thumb_lx = user.thumb_ly = 0;
+    }
+  }
 }
 
 void FilterState(uint32_t user_index, rex::input::X_INPUT_STATE& state) {
@@ -65,6 +93,8 @@ void FilterState(uint32_t user_index, rex::input::X_INPUT_STATE& state) {
   {
     std::lock_guard lock(g_mutex);
     User& user = g_users[user_index];
+    user.last_poll = Clock::now();
+    user.seen = true;
     const uint16_t pressed = buttons & ~user.previous;
     user.previous = buttons;
     if ((buttons & kCombo) == kCombo && (pressed & kCombo)) {
@@ -86,22 +116,24 @@ void FilterState(uint32_t user_index, rex::input::X_INPUT_STATE& state) {
     user.right_trigger = state.gamepad.right_trigger;
     user.thumb_lx = int16_t(state.gamepad.thumb_lx);
     user.thumb_ly = int16_t(state.gamepad.thumb_ly);
-    user.seen = true;
 
     const bool hide = g_menu_wanted || user.wait_release;
-    if (hide != user.hidden) {
-      user.hidden = hide;
-      ++user.packet_offset;
-    }
     if (hide) state.gamepad = {};
-    state.packet_number = uint32_t(state.packet_number) + user.packet_offset;
+    if (std::memcmp(&state.gamepad, &user.reported, sizeof(user.reported)) != 0) {
+      user.reported = state.gamepad;
+      ++user.packet;
+    }
+    state.packet_number = user.packet;
   }
   if (request_menu) request_menu(request_open);
 }
 
-bool FilterKeystroke(uint32_t) {
+bool FilterKeystroke(uint32_t user_index) {
   std::lock_guard lock(g_mutex);
   if (g_menu_wanted) return false;
+  ForgetStaleLocked(Clock::now());
+  if (user_index < kUsers) return !g_users[user_index].wait_release;
+  // Any user (XUSER_INDEX_ANY).
   return std::none_of(g_users.begin(), g_users.end(),
                       [](const User& user) { return user.wait_release; });
 }
@@ -164,6 +196,7 @@ void FeedMenuGamepad(ImGuiIO& io) {
   uint8_t left_trigger = 0, right_trigger = 0;
   {
     std::lock_guard lock(g_mutex);
+    ForgetStaleLocked(Clock::now());
     for (const auto& user : g_users) {
       if (!user.seen) continue;
       buttons |= user.buttons;

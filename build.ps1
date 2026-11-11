@@ -89,10 +89,13 @@ if ($SdkSource) {
         if (-not $git) { throw 'Git is required to fetch the ReXGlue SDK.' }
         Invoke-Step 'sdk-clone' $git @('-c', 'core.symlinks=false', '-c', 'core.longpaths=true', 'clone', '--branch', $sdkTag,
             '--depth', '1', $sdkUrl, $sdk)
-        Invoke-Step 'sdk-submodules' $git @('-c', 'core.symlinks=false', '-c', 'core.longpaths=true', 'submodule', 'update',
-            '--init', '--recursive', '--depth', '1', '--jobs', '8') $sdk
     }
     if (-not (Test-Path -LiteralPath $marker)) {
+        # Until the tree is patched, so a submodule fetch that failed part way is completed on
+        # the next run instead of leaving missing files for the configure step.
+        if (-not $git) { throw 'Git is required to fetch the ReXGlue SDK.' }
+        Invoke-Step 'sdk-submodules' $git @('-c', 'core.symlinks=false', '-c', 'core.longpaths=true', 'submodule', 'update',
+            '--init', '--recursive', '--depth', '1', '--jobs', '8') $sdk
         Invoke-Step 'sdk-patch' $git @('apply', '--whitespace=nowarn', $patch) $sdk
         Set-Content -LiteralPath $marker -Value $patchHash -Encoding ascii
     } elseif ((Get-Content -LiteralPath $marker -Raw).Trim() -ne $patchHash) {
