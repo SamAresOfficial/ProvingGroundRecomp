@@ -1253,3 +1253,113 @@ What stays: the ~29 image-barrier breaks a heavy frame are the game's own resolv
 render target switches (one pass per post effect, each sampling the previous one), not
 removable without merging passes; one run of this batch ended at ~20 s at startup with the
 known guest access violation (read of guest 0x00000008, cvar 16), the rerun was complete.
+
+## Temporal upscaling: FSR 2/3 with real inputs (2026-11-11)
+
+Not run in game yet: written and checked without the game (syntax on Linux and for Windows, the
+shaders through glslang, the jitter and motion vector math in a standalone test). The test steps
+are at the end.
+
+**Before.** The presenter's `fsr2`/`fsr3` effects ran the FidelityFX upscaler while painting, on
+the finished image, with `reset = true`, no jitter, the color image passed as depth and as motion
+vectors, and a fixed 16.666 ms: a spatial upscale at the cost of the temporal pass chain. It also
+ran once per paint, not once per guest frame, so its history could not have been right even with
+inputs.
+
+**Now (Vulkan).** The upscaler runs in the swap (`VulkanCommandProcessor::IssueSwap`), once per
+guest frame, and the presenter only places the result:
+
+- **Sizes.** The presenter publishes the size it paints the guest output at
+  (`VulkanPresenter::GetTemporalUpscaleTarget`, set while painting when the effect is `fsr2` or
+  `fsr3`). The swap refreshes the guest output at that size. The render size is the front
+  buffer's, which with `resolution_scale` 1 is the 3D scene's own scale
+  (`native_main_pass_scale_sixteenths`): the options menu sets both when FSR is chosen. A new
+  output size (a window being resized) is taken after 20 swaps, since each needs a new upscaler.
+- **Jitter.** Halton(2,3) in -0.5..0.5 of a render pixel, the period FSR recommends
+  (8 x area scale), a new offset each swap. It is added to the host viewport
+  (`UpdateDynamicState`) of the draws `IsTemporalJitterDraw` accepts: depth test on, the main
+  scene's depth buffer bound (`RenderTargetCache::IsMainPassKey`), positions in clip space
+  through the viewport. Full-screen passes and the HUD have no depth test and stay put; they
+  read the jittered scene through textures. The viewport moves right and down by the offset,
+  which is FSR's convention (projection translated by 2j/size, -2j/size for Y up).
+- **Depth.** The main pass's host depth render target (the one the camera was recorded on),
+  copied to R32F by the inputs compute pass. 0 near, far plane at infinity
+  (`FFX_UPSCALE_ENABLE_DEPTH_INFINITE`), as frame generation already assumed.
+- **Motion vectors.** Camera reprojection, the frame generation design: the world and
+  world-view-projection constants of the main pass's first draw give the view-projection
+  (`fsr3_camera_world_constant` 216, `fsr3_camera_world_view_projection_constant` 224, set in
+  `pg_app.h`); each pixel's depth is unprojected with this frame's matrix and projected with the
+  previous one. The pixel's position has the jitter taken off first, so the vectors have none.
+  Things that move on their own (the skater, other skaters, cars) get the camera's motion only;
+  FSR's own disocclusion and luminance checks have to cope, there is no per-object mask.
+  `UpdateFrameGenerationCamera` now also scales the viewport of render targets with their own
+  scale to host pixels (it was in guest pixels, which made the frame generation vectors wrong
+  with `native_main_pass_scale_sixteenths` other than 16).
+- **HUD.** The game draws the HUD into the same EDRAM target as the scene (color at tile 0), so
+  the final image has it. Upscaling before the HUD would need that target to change scale in
+  the middle of the frame (the scene and post chain at render size, the HUD at output size), with
+  ownership transfers both ways every frame and the upscaler's output placed in an own-scale
+  texture of another scale than its render target: not attempted blind. Instead: the last
+  resolve of the same target before the front buffer's (the frame generation "hudless" address)
+  is compared with the final image; where they differ by more than a threshold (3x3 widened) is
+  the HUD mask. The mask goes to FSR as reactive and transparency-and-composition mask, and
+  after FSR a compute pass puts the bilinearly scaled final image over the output where the mask
+  is set (the HUD is not jittered, so through FSR it would wobble by the jitter).
+- **Reset.** On the first frame, a new upscaler or size, a frame without a camera (menus,
+  loading, videos: constant depth, zero vectors, reset every frame), more than 500 ms since the
+  last swap, a missed refresh, and a camera cut: far points or a near point reprojecting more
+  than `fsr_temporal_camera_cut` of the width away, or behind the camera.
+- **Frame time** is the time between swaps.
+- **Recording.** FidelityFX records into a real `VkCommandBuffer`, the command processor into
+  its deferred stream: `DeferredCommandBuffer::CmdExternal` calls
+  `VulkanPresenter::RecordTemporalUpscale` when the stream is executed (on the submission thread
+  with `vulkan_async_submission`). The upscaler is created by the command processor thread after
+  awaiting every earlier submission, so the two never overlap. If the dispatch fails there, a
+  bilinear blit writes the output instead.
+- **Fallbacks.** No FidelityFX runtime, creation failed, render size above the output size, the
+  3D scene not at the final image's size (`resolution_scale` above 1 with another own scale),
+  `fsr_temporal_upscaling=false`: the guest output stays at render size and the presenter paints
+  it with FSR 1 (EASU + RCAS), one log line. FSR 1 itself (`present_effect=fsr`) is unchanged.
+- **Direct3D 12.** Not done: that renderer records no camera, has no own-scale main pass and no
+  compute passes for the inputs (they would need DXBC built with the Windows SDK). Its `fsr2`/
+  `fsr3` now scale with FSR 1 (`d3d12_fsr_temporal_without_history=true` brings back the old
+  per-paint dispatch, now with the real frame time), and the options menu offers FSR with Vulkan
+  only.
+
+Cost per frame on top of the scene at render size: the gamma pass (as before, now into the
+color input), one render-size compute pass for depth and vectors, one for the mask, FSR itself,
+and an output-size compute pass that exits early outside the HUD. No full-size copies: FSR
+writes the guest output image directly.
+
+Cvars (GPU/Vulkan unless noted): `fsr_temporal_upscaling` (true), `fsr_temporal_jitter` (1; 0
+off, 2 only draws using the camera constants), `fsr_temporal_hud_mask` (true),
+`fsr_temporal_hud_mask_threshold` (0.1), `fsr_temporal_camera_cut` (0.35),
+`fsr_temporal_debug_view` (false); UI/Presenter: `fsr_temporal_depth_infinite` (true),
+`fsr_temporal_depth_inverted` (false), `fsr_temporal_view_space_to_meters` (1.0); UI/D3D12:
+`d3d12_fsr_temporal_without_history` (false).
+
+To check in game (Vulkan, a 1080p or larger screen):
+
+1. Anti-aliasing: AMD FSR 3.1, FSR quality: Quality; restart if the note about Effects and HUD
+   shows. The log has "FidelityFX temporal upscaler ... created for 1280x720 to 1920x1080" and
+   no "Temporal upscaling is not used".
+2. Stand still: edges (rails, wires, fences) settle within a few frames and stay; no shimmer.
+   Compare with Anti-aliasing Off + Sharpness 50% (FSR 1) at the same Resolution.
+3. Skate and turn the camera: no trails behind the skater, no smearing of the ground; a cut
+   (bail camera, replay, menu to game) shows no ghost of the previous view.
+4. HUD (score, special meter, trick text): sharp, steady, no trail when the camera moves.
+   If the whole image shimmers instead, the image before the HUD is not what the mask assumes:
+   try `--fsr_temporal_hud_mask=false` (the HUD may then trail) or raise
+   `--fsr_temporal_hud_mask_threshold`.
+5. `--fsr_temporal_debug_view=true` shows FSR's view of the inputs: motion vectors should be
+   zero when standing still and follow the camera when turning; depth should show the scene.
+   Vectors pointing the wrong way or doubled mean a sign or scale error
+   (`fsr_temporal_jitter=0` separates jitter errors from vector errors: the image is then
+   steady but no sharper than FSR 1).
+6. Post effects aligned (bloom, the character outline, depth fog): a doubled or blurred outline
+   means a depth-tested full-screen pass is being jittered; `--fsr_temporal_jitter=2` limits
+   the jitter to draws that use the camera constants.
+7. Menus, loading screens and videos look as with FSR 1 (they are reset every frame).
+8. `--vulkan_gpu_timing=true`: frame GPU time at Quality against the same Resolution with FSR 1,
+   and against Native AA.
+9. Resize the window: the image stretches for about 20 frames, then is rebuilt at the new size.

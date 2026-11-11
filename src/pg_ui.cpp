@@ -55,8 +55,10 @@ REXCVAR_DEFINE_STRING(renderer, "vulkan", "Video",
     .allowed({"vulkan", "d3d12"})
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_STRING(upscaler, "off", "Video",
-                      "How the rendered image is scaled to the screen: off (bilinear) or fsr (AMD "
-                      "FSR; turned off in this version, fsr is ignored)")
+                      "How the rendered image is scaled to the screen: off (bilinear, or AMD FSR 1 "
+                      "with sharpness above 0) or fsr (AMD FSR 3.1 temporal upscaling and "
+                      "anti-aliasing from render_resolution to the screen; Vulkan only, and the "
+                      "effects and the HUD then render at render_resolution too)")
     .allowed({"off", "fsr"})
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_INT32(sharpness, 0, "Video",
@@ -124,19 +126,6 @@ bool Fsr3Available() {
   return std::find(allowed.begin(), allowed.end(), "fsr3") != allowed.end();
 }
 
-// AMD's FSR SDK 2 runtime for Direct3D 12, which the D3D12 presenter loads; it runs FSR 4 on GPUs
-// whose driver supports it and FSR 3.1 on others.
-constexpr const char* kFsr4Runtime = "amd_fidelityfx_loader_dx12.dll";
-
-bool Fsr4RuntimePresent() {
-#if REX_PLATFORM_WIN32
-  std::error_code ec;
-  return std::filesystem::exists(rex::filesystem::GetExecutableFolder() / kFsr4Runtime, ec);
-#else
-  return false;
-#endif
-}
-
 // The GPU plugin registers the cvars of every renderer compiled into it. Before it is loaded (the
 // start-up launcher), the SDK's build says.
 bool D3D12Available() {
@@ -151,27 +140,31 @@ bool D3D12Available() {
 
 bool UsingD3D12() { return REXCVAR_GET(renderer) == "d3d12" && D3D12Available(); }
 
-// FSR is turned off until it scales the 3D pass itself: the presenter runs it on the finished image,
-// already stretched to the effects and HUD size, so it cost GPU time and the picture looked the
-// same. With this false it is not offered and a saved upscaler = fsr is ignored.
-constexpr bool kFsrOffered = false;
+// FSR (the temporal upscaler, FSR 3.1) is done by the Vulkan renderer, which gives it what it
+// needs from the game: the 3D scene drawn with a sub-pixel jitter, its depth, and the camera's
+// motion. The Direct3D 12 renderer has none of that, so there FSR is not offered (its presenter
+// would scale each finished image with FSR 1).
+bool FsrAvailable() { return Fsr3Available() && !UsingD3D12(); }
 
-bool FsrAvailable() {
-  return kFsrOffered && Fsr3Available() && (!UsingD3D12() || Fsr4RuntimePresent());
-}
+// FSR chosen and possible with this renderer, whatever the resolution.
+bool FsrSelected() { return REXCVAR_GET(upscaler) == "fsr" && FsrAvailable(); }
 
-int32_t RenderResolutionScale();
+double RenderResolutionFactor();
 // resolution_scale the running game was started with (it cannot change while it runs).
 int32_t g_running_scale = 0;
 
-// FSR gets the game's final image, which is 720p times the effects and HUD scale. Without motion
-// vectors or jitter it adds nothing at 1:1 (the image looked the same with it off) and still cost
-// over a millisecond a frame, so it is only offered when that image is smaller than the screen.
-// The scale is the running one in game, else the setting.
-bool FsrUseful(int32_t scale) { return uint32_t(720 * scale) < DisplayHeight(); }
-bool FsrUseful() { return FsrUseful(g_running_scale ? g_running_scale : RenderResolutionScale()); }
+// FSR takes the image from the resolution to the screen, or anti-aliases it at the same size: it
+// has nothing to do for a resolution above the screen's.
+bool FsrUseful() {
+  return uint32_t(std::lround(RenderResolutionFactor() * 720.0)) <= DisplayHeight();
+}
 
-bool FsrEnabled() { return REXCVAR_GET(upscaler) == "fsr" && FsrAvailable() && FsrUseful(); }
+// FSR needs the final image at the size of the 3D scene, which is so with the effects and the
+// HUD at 1x (they then follow the resolution): a game started at another scale gets it after a
+// restart.
+bool FsrEnabled() {
+  return FsrSelected() && FsrUseful() && (!g_running_scale || g_running_scale == 1);
+}
 
 // render_resolution as width and height: WIDTHxHEIGHT, or one of the older names.
 std::pair<int, int> RenderResolutionSize(const std::string& value) {
@@ -194,6 +187,10 @@ double RenderResolutionFactor() {
 // The SDK's whole-number EDRAM scale (resolution_scale) for the effects and the HUD: the setting,
 // or the nearest one to the 3D resolution.
 int32_t RenderResolutionScale() {
+  // With FSR, everything renders at the resolution (the 3D scene's own scale), which FSR takes
+  // to the screen: a whole-number scale for the effects and the HUD would make the final image a
+  // resampled 3D scene, which FSR can't work on.
+  if (FsrSelected()) return 1;
   const std::string effects = REXCVAR_GET(effects_resolution);
   if (effects == "1" || effects == "2" || effects == "3") return effects[0] - '0';
   return std::clamp(int32_t(std::lround(RenderResolutionFactor())), 1, 3);
@@ -479,11 +476,11 @@ void SetWindowPhysicalHeight(uint32_t height) {
 }
 
 void ApplyUpscaler() {
-  // The game renders at the mode's resolution (resolution_scale) and FSR takes that image to the
-  // screen; "nativeaa" makes the presenter run FSR also at 1:1 and never shrink its input first.
-  // The presenter's "fsr3" effect is FidelityFX's upscaler, which is FSR 4 where the D3D12
-  // runtime offers it. The cvars cover a presenter created later; the paint config changes the
-  // running one.
+  // The game renders at the resolution and FSR takes that image to the screen. The presenter's
+  // "fsr3" effect is FidelityFX's temporal upscaler, which the Vulkan renderer runs at the end of
+  // each frame with the game's depth, camera motion and jitter ("nativeaa": at any size up to
+  // the screen's, also 1:1). The cvars cover a presenter created later; the paint config changes
+  // the running one.
   const bool fsr3 = FsrEnabled();
   const bool fsr1 = !fsr3 && SharpeningEnabled();
   const double cas_sharpness = REXCVAR_GET(sharpness) / 100.0;
@@ -970,13 +967,16 @@ constexpr const char* kPresentSyncHelp =
     "tearing, but uneven frame times when the rate doesn't divide the refresh rate). Off never "
     "waits.";
 constexpr const char* kAntiAliasingHelp =
-    "FXAA smooths edges in each frame. AMD FSR AA smooths them and also takes the internal "
-    "resolution to your screen: FSR 3.1 with Vulkan, FSR 4 with Direct3D 12 (the newest FSR your "
-    "GPU driver offers: FSR 4.1 on Radeon RX 9000 and 7000, and on RX 6000 with recent drivers).\n\n"
-    "The game's renderer has no motion vectors or camera jitter to give FSR, so it works on each "
-    "frame on its own, without the temporal detail it adds in PC games. It can only be chosen "
-    "when Effects and HUD render below your screen's height: at the same size it changed nothing "
-    "and still cost GPU time.";
+    "FXAA smooths edges in each frame. AMD FSR 3.1 builds each frame from several: the game is "
+    "rendered at the resolution, shifted by a fraction of a pixel every frame, and FSR combines "
+    "the frames into an image at your screen's size, smoother and more detailed than one frame "
+    "scaled up. With the resolution at your screen's size it only smooths edges.\n\n"
+    "With FSR the effects and the HUD render at the resolution too (Effects and HUD is not "
+    "used). Vulkan only. It can't be chosen for a resolution above your screen's.";
+constexpr const char* kFsrQualityHelp =
+    "The resolution FSR starts from, as a fraction of your screen: Quality renders 1.5x fewer "
+    "pixels in each direction, Balanced 1.7x, Performance 2x, Ultra performance 3x. Lower is "
+    "faster and less sharp. This sets Resolution.";
 constexpr const char* kFsrVersionHelp =
     "Which FSR from AMD's runtime to use; Newest is what AMD picks for your GPU.";
 
@@ -991,17 +991,18 @@ constexpr const char* kRendererHelp =
 // screen. Stored as swap_post_effect, and upscaler for FSR.
 bool AntiAliasingSetting() {
   std::vector<Choice> choices = kAntiAliasing;
-  // With the effects and HUD at the screen's size FSR has nothing to scale: listed, not selectable.
-  const bool fsr_useful = FsrUseful(RenderResolutionScale());
+  // With the resolution above the screen's FSR has nothing to scale: listed, not selectable.
+  const bool fsr_useful = FsrUseful();
   static std::string fsr_label;
   if (FsrAvailable()) {
-    fsr_label = UsingD3D12() ? "AMD FSR 4 AA" : "AMD FSR 3.1 AA";
+    fsr_label = "AMD FSR 3.1";
     if (!fsr_useful) {
-      fsr_label += " (Effects and HUD below " + std::to_string(DisplayHeight()) + "p)";
+      fsr_label += " (resolution up to " + std::to_string(DisplayHeight()) + "p)";
     }
     choices.push_back({"fsr", fsr_label.c_str()});
   }
-  const std::string current = FsrEnabled() ? "fsr" : SettingValue("swap_post_effect", "none");
+  const std::string current =
+      FsrSelected() && fsr_useful ? "fsr" : SettingValue("swap_post_effect", "none");
   const char* preview = current.c_str();
   for (const auto& choice : choices) {
     if (current == choice.value) preview = choice.label;
@@ -1018,6 +1019,49 @@ bool AntiAliasingSetting() {
           const bool fsr = std::string_view(choice.value) == "fsr";
           rex::cvar::SetFlagByName("upscaler", fsr ? "fsr" : "off");
           SetSetting("swap_post_effect", fsr ? "none" : choice.value);
+          changed = true;
+        }
+        if (selected) ImGui::SetItemDefaultFocus();
+      }
+      ImGui::EndCombo();
+    }
+    return changed;
+  });
+}
+
+// FSR's usual quality modes, as the resolution each gives on this screen: with FSR on, the
+// resolution is what it starts from.
+struct FsrQuality {
+  const char* label;
+  double ratio;
+};
+constexpr FsrQuality kFsrQualities[] = {
+    {"Native AA", 1.0},   {"Quality", 1.5},           {"Balanced", 1.7},
+    {"Performance", 2.0}, {"Ultra performance", 3.0},
+};
+
+std::string FsrQualityResolution(double ratio) {
+  // In the steps of 1/16 of 720p the 3D scene renders at.
+  const long sixteenths =
+      std::clamp(std::lround(double(DisplayHeight()) / ratio * 16.0 / 720.0), 4l, 63l);
+  return std::to_string(1280 * sixteenths / 16) + "x" + std::to_string(720 * sixteenths / 16);
+}
+
+bool FsrQualitySetting() {
+  const std::string current = SettingValue("render_resolution", "720p");
+  std::string preview = "Custom (" + current + ")";
+  for (const FsrQuality& quality : kFsrQualities) {
+    if (FsrQualityResolution(quality.ratio) == current) preview = quality.label;
+  }
+  return Row("FSR quality", kFsrQualityHelp, [&] {
+    bool changed = false;
+    if (ImGui::BeginCombo("##combo", preview.c_str())) {
+      for (const FsrQuality& quality : kFsrQualities) {
+        const std::string resolution = FsrQualityResolution(quality.ratio);
+        const std::string label = std::string(quality.label) + " (" + resolution + ")";
+        const bool selected = resolution == current;
+        if (ImGui::Selectable(label.c_str(), selected) && !selected) {
+          SetSetting("render_resolution", resolution);
           changed = true;
         }
         if (selected) ImGui::SetItemDefaultFocus();
@@ -1115,7 +1159,11 @@ bool GraphicsSettings(bool in_game) {
     if (in_game) ApplyResolutionLive();
     changed = true;
   }
-  changed |= EffectsResolutionSetting();
+  if (FsrSelected()) {
+    MutedNote("With AMD FSR, the effects and the HUD render at the resolution.");
+  } else {
+    changed |= EffectsResolutionSetting();
+  }
   if (in_game && g_running_scale && RenderResolutionScale() != g_running_scale) {
     const std::string note = "Effects and HUD switch to " +
                              std::to_string(RenderResolutionScale()) +
@@ -1131,6 +1179,10 @@ bool GraphicsSettings(bool in_game) {
     changed = true;
   }
   const bool fsr = FsrEnabled();
+  if (FsrSelected() && FsrQualitySetting()) {
+    if (in_game) ApplyResolutionLive();
+    changed = true;
+  }
   if (fsr && UsingD3D12() && !rex::cvar::GetFlagByName("d3d12_fsr_versions").empty()) {
     changed |= ComboSetting("FSR version", "d3d12_fsr_version", FsrVersionChoices(),
                             kFsrVersionHelp);
@@ -1403,10 +1455,11 @@ void LauncherSettingsPage(LauncherState& state) {
   }
   if (D3D12Available()) ComboSetting("Renderer", "renderer", kRenderers, kRendererHelp);
   ResolutionSetting();
-  EffectsResolutionSetting();
+  if (!FsrSelected()) EffectsResolutionSetting();
   ComboSetting("Texture filtering", "anisotropic_override", kTextureFiltering,
                kTextureFilteringHelp, "3");
   AntiAliasingSetting();
+  if (FsrSelected()) FsrQualitySetting();
   if (FsrEnabled() || SharpeningAvailable()) SharpnessSetting();
   EndCard();
 }

@@ -43,8 +43,8 @@ Not tested on a handheld yet. What to expect on a ROG Xbox Ally / Ally X:
   so with Vsync on Automatic each frame is shown for exactly 3 or 2 refreshes, without tearing).
   Effects and HUD on Automatic picks 2x at 1080p, which renders them at 1440p and costs GPU time
   the small screen can't show.
-- FSR 3/4 are turned off in this version (see below), so nothing here depends on FSR 4, which
-  needs a Radeon RX 9000 GPU.
+- AMD FSR 3.1 (Anti-aliasing, Vulkan) renders below the screen's resolution and rebuilds the
+  full image from several frames; it works on any GPU. See below.
 
 ## Options
 
@@ -59,7 +59,8 @@ Not tested on a handheld yet. What to expect on a ROG Xbox Ally / Ally X:
 | Resolution | What the 3D scene renders at: your screen's resolutions are listed, 1280 x 720 is the original. The game's image is 16:9 and fits inside the chosen size. With Vulkan it changes at once in the Insert menu; with Direct3D 12 it follows Effects and HUD. |
 | Effects and HUD | What the effects (bloom, blur, the final image) and the HUD render at: 1x (720p), 2x (1440p), 3x (4K), or Automatic, the nearest one to the resolution. Lower is faster. Applies on the next start. |
 | Texture filtering | Anisotropic filtering, Off to 16x (4x by default): keeps the ground and ramps sharp into the distance. |
-| Anti-aliasing | Off or FXAA. |
+| Anti-aliasing | Off, FXAA, or AMD FSR 3.1 (Vulkan), which renders at the Resolution and rebuilds the image at your screen's size from several frames. See below. |
+| FSR quality | With AMD FSR: Native AA, Quality, Balanced, Performance or Ultra performance. It sets the Resolution for your screen. |
 | Sharpness | AMD FSR 1 sharpening of the final image, Off by default. When the game's image is smaller than the window (Effects and HUD below your screen), FSR 1 also upscales it. Applies at once. |
 | Button icons | Automatic, Xbox or PlayStation. See Controls. |
 | Show FPS counter | A small counter in the top-right corner. |
@@ -70,9 +71,15 @@ icons apply on the next start; resolution, texture filtering and sharpness apply
 **Performance** tab lists the shortcuts the native renderer takes (all on by default); turning
 one off shows whether it causes a glitch you see. They reset when the game closes.
 
-About AMD FSR 3 and 4: they are turned off in this version (the Sharpness slider is FSR 1). It ran on the finished image, which the game had
-already scaled to the effects and HUD size, so it cost GPU time and the picture looked the same.
-It will come back once it scales the 3D scene itself.
+About AMD FSR 3.1 (Anti-aliasing, with the Vulkan renderer): the game is rendered at the
+Resolution, moved by a fraction of a pixel on every frame, and FSR combines the frames, with the
+game's depth and camera motion, into an image at your screen's size. **FSR quality** picks the
+resolution for you: Quality renders 1.5x fewer pixels in each direction, Balanced 1.7x,
+Performance 2x, Ultra performance 3x, and Native AA only smooths edges at your screen's size.
+With FSR on, the effects and the HUD render at the Resolution too (Effects and HUD is not used;
+switching it takes a restart when the game was started at 2x or 3x), FXAA is off, and Sharpness
+is FSR's own sharpening. With Direct3D 12 FSR is not offered: that renderer has no depth or
+motion to give it, and the Sharpness slider (FSR 1) scales the image instead.
 
 ## Controls
 
