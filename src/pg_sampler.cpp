@@ -161,15 +161,36 @@ class UnwindTables {
   std::vector<Image> images_;
 };
 
-// Unwinds a suspended thread's stack. Must not allocate or take locks: the thread may hold the
-// heap lock or the loader's.
-int CaptureStack(HANDLE thread, const UnwindTables& tables, uint64_t* frames) {
-  CONTEXT context = {};
-  context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
-  if (!GetThreadContext(thread, &context)) return 0;
+// The top of a thread's stack (NT_TIB::StackBase in its TEB), read while it runs: an unwound
+// frame outside [Rsp, top) is garbage and ends the walk.
+uint64_t ThreadStackBase(HANDLE thread) {
+  struct ThreadBasicInformation {
+    LONG exit_status;
+    PVOID teb_base_address;
+    PVOID client_id[2];
+    ULONG_PTR affinity_mask;
+    LONG priority;
+    LONG base_priority;
+  };
+  using NtQueryInformationThreadFn = LONG(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+  static auto query = reinterpret_cast<NtQueryInformationThreadFn>(
+      GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread"));
+  ThreadBasicInformation info = {};
+  if (!query || query(thread, 0 /* ThreadBasicInformation */, &info, sizeof(info), nullptr) < 0 ||
+      !info.teb_base_address) {
+    return 0;
+  }
+  return reinterpret_cast<uint64_t>(static_cast<NT_TIB*>(info.teb_base_address)->StackBase);
+}
+
+// The walk itself. Separate, as structured exception handling can't be used in a function with
+// objects to destroy.
+int WalkStack(CONTEXT& context, uint64_t stack_base, const UnwindTables& tables,
+              uint64_t* frames) {
   int count = 0;
   while (count < kMaxFrames && context.Rip) {
     frames[count++] = context.Rip;
+    const uint64_t rsp = context.Rsp;
     DWORD64 image_base = 0;
     PRUNTIME_FUNCTION function = tables.Lookup(context.Rip, &image_base);
     if (!function) {
@@ -183,14 +204,40 @@ int CaptureStack(HANDLE thread, const UnwindTables& tables, uint64_t* frames) {
       }
       context.Rip = return_address;
       context.Rsp += 8;
-      continue;
+    } else {
+      void* handler_data = nullptr;
+      DWORD64 establisher_frame = 0;
+      RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, context.Rip, function, &context,
+                       &handler_data, &establisher_frame, nullptr);
     }
-    void* handler_data = nullptr;
-    DWORD64 establisher_frame = 0;
-    RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, context.Rip, function, &context,
-                     &handler_data, &establisher_frame, nullptr);
+    // Each caller's frame is above its callee's, inside the stack: anything else means the
+    // walk went off a guessed return address or a frame register holding something else.
+    if (context.Rsp <= rsp || (stack_base && context.Rsp >= stack_base)) {
+      break;
+    }
   }
   return count;
+}
+
+// Unwinds a suspended thread's stack. Must not allocate or take locks: the thread may hold the
+// heap lock or the loader's.
+int CaptureStack(HANDLE thread, uint64_t stack_base, const UnwindTables& tables,
+                 uint64_t* frames) {
+  CONTEXT context = {};
+  context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+  if (!GetThreadContext(thread, &context)) return 0;
+  if (stack_base && (context.Rsp >= stack_base)) return 0;
+#ifdef _MSC_VER
+  // A frame register holding something other than a frame pointer can send RtlVirtualUnwind to
+  // unmapped memory before the range check catches it; drop such a sample instead of the game.
+  __try {
+    return WalkStack(context, stack_base, tables, frames);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return 0;
+  }
+#else
+  return WalkStack(context, stack_base, tables, frames);
+#endif
 }
 
 }  // namespace
@@ -218,6 +265,7 @@ PgSampler::PgSampler(std::string report_path, uint32_t period_ms)
     struct Target {
       DWORD id;
       HANDLE handle;
+      uint64_t stack_base;
     };
     std::vector<Target> targets;
     UnwindTables unwind_tables;
@@ -248,14 +296,14 @@ PgSampler::PgSampler(std::string report_path, uint32_t period_ms)
             HANDLE handle = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
                                            THREAD_QUERY_LIMITED_INFORMATION,
                                        FALSE, entry.th32ThreadID);
-            if (handle) targets.push_back({entry.th32ThreadID, handle});
+            if (handle) targets.push_back({entry.th32ThreadID, handle, ThreadStackBase(handle)});
           }
           CloseHandle(snapshot);
         }
       }
       for (const Target& target : targets) {
         if (SuspendThread(target.handle) == DWORD(-1)) continue;
-        int count = CaptureStack(target.handle, unwind_tables, frames);
+        int count = CaptureStack(target.handle, target.stack_base, unwind_tables, frames);
         ResumeThread(target.handle);
         if (!count) continue;
         std::lock_guard lock(state->mutex);
