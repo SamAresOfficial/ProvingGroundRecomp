@@ -266,6 +266,22 @@ lookup for dynamic data is a bit test, and a static index buffer skips the looku
 range was replaced. Uncapped heavy frames: 6.10-6.16 ms. Tried and dropped: keeping a texture
 binding when the guest writes the same fetch constant again (+0.29 ± 0.26 ms, no gain).
 
+Follow-up (2026-11-11): the converted copies now live in video memory and their space is
+reused. On Vulkan the 16 MB chunks are device-local. Where the device has a device-local,
+host-visible heap of at least 1 GB (resizable BAR, integrated GPUs), the chunks are mapped
+and written directly, and only the written bytes are flushed when the memory is not coherent.
+Otherwise each conversion is written to a staging buffer, and the copy is recorded in the
+submission-start command buffer, before every draw of that submission, with a barrier to
+index reads. Each chunk has a first-fit free list. A conversion is released when its entry
+is replaced by different contents, or when its range has been forgotten and not drawn for
+300 frames (at once when space runs out). Its space is reused after the submission that
+released it completes, which also covers native mesh draws (step 9) that bind the buffer
+without going through the primitive processor. Entries whose range is still registered are
+never evicted, for the same reason. When the budget is full, new meshes are converted every
+frame as before, and they are tried again once space has been freed. Cvars:
+`vulkan_static_index_buffer_budget_mb` (128; 0 converts every frame) and
+`vulkan_static_index_buffer_direct_write` (true; false forces the staging path, for testing).
+
 Also tried and dropped (same day), each with an in-run A/B: a material binding cache that
 keeps what every texture fetch constant resolved to (it served about 1700 constants a heavy
 frame, nearly all of them, and changed nothing: +0.015 ± 0.21 ms), and a per-submission cache
@@ -685,6 +701,17 @@ washed out the image (bloom/lighting), so those clears are left to the draw.
 Result: the transfers into the shadow maps, the small pass and the main pass are gone; only the
 1-3 tile bloom transfers remain. In-run A/B (heavy frames, 30-frame halves): -0.24 +- 0.14 ms.
 Images match the step 1 captures.
+
+Draws that are not recognized as clears but overwrite a whole render target (a rectangle list
+with replace blending, a full color mask, depth and stencil "always" + write) also skip the
+copy of the previous EDRAM contents (`render_target_skip_overwritten_transfers`, default on,
+hot-reloadable; turn it off to A/B). The decision is made in the render target cache's
+`Update`, before the pipeline is known, so the skipped transfers are kept until the draw is
+recorded. If it is not (a placeholder pipeline while the real one compiles asynchronously,
+whose pixel shader discards everything, or any failure after `Update` in `IssueDraw`), they are
+performed then (`RenderTargetCache::OnLastUpdateDrawAbandoned`), which gives the same contents
+as not skipping them since nothing was drawn in between. Pixel shaders that may kill pixels
+(kill, memexport, alpha test other than "always", alpha to coverage) never skip.
 
 ### Step 3: resolves as direct textures
 

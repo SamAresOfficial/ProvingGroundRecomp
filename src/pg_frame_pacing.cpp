@@ -7,7 +7,8 @@
 // engine's vblank counter (sub_8234BD00, called on each vblank) is also a clock: the cutscene
 // cameras (sub_82432538, "Cam segment %d ready ...") measure time as vblanks / 60 Hz, so they
 // ran many times too fast. Here both intervals are 0, so the game doesn't wait for vblanks, and
-// the engine's counter only advances once per real 1/60 s.
+// the engine's counter advances at a real 60 Hz, in step with the main loop's frames (see
+// EngineVblankClock).
 #include "pg_frame_pacing.h"
 #include "pg_dev.h"
 #include "native/pg_d3d_trace.h"
@@ -16,6 +17,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
@@ -51,6 +53,12 @@ REXCVAR_DEFINE_INT32(frame_rate_limit, 60, "Video",
 REXCVAR_DEFINE_BOOL(swap_waits_for_new_frame, true, "Video",
                     "After a swap, the render thread waits for the game's next frame instead of "
                     "presenting the last one again")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(cutscene_clock_follows_frames, true, "GPU",
+                    "Without vsync, advance the engine's 60 Hz vblank counter (the cutscene "
+                    "cameras' clock) at the main loop's frames, so each frame at 60 FPS sees "
+                    "one step, rather than at real 1/60 s boundaries that frames cross at "
+                    "random phase")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_STRING(pacing_trace_csv, "", "Perf",
                       "Write one line per swap (host time, main loop frames, engine time) to "
@@ -346,23 +354,102 @@ extern "C" void sub_8268D3A8(PPCContext& __restrict ctx, uint8_t* base) {
   __imp__sub_8268D3A8(ctx, base);
 }
 
+namespace {
+
+// The engine's vblank counter as a clock. sub_8234BD00 runs on each vblank interrupt and
+// advances the counter that the cutscene cameras (sub_82432538) read as vblanks / 60. Without
+// vsync the SDK interrupts every millisecond, so uncapped the hook below runs the original only
+// as many times as this clock says are due.
+//
+// Advancing it at real 1/60 s boundaries kept the speed right, but a boundary has no fixed phase
+// relative to the game's frames: at 60 FPS frames close to a boundary saw 0 or 2 steps, a visible
+// judder in camera pans, and above 60 FPS the steps fell unevenly (gaps of 1, 2 or 3 frames at
+// 120 FPS). So the clock advances when the main loop hands over a frame, by the 1/60 s elapsed
+// since the last frame rounded to whole steps. The part not given is carried to the next frame,
+// so in the long run the count follows real time, and it is pulled slowly toward zero. Without
+// that pull the carried part would keep whatever phase the first frame had, and the frame limiter
+// restarting its schedule after a late frame would sooner or later leave it near half a step,
+// where timer jitter brings back the 0/2 steps. With it, at 60 FPS every frame sees one step, and
+// at other rates the steps are spaced as evenly as whole steps allow. The pull costs at most a
+// few hundredths of a percent of cutscene speed at some frame rates (measured in a simulation of
+// 45-240 FPS with timer jitter and late frames).
+//
+// The steps are still delivered by the vblank interrupt, at most a millisecond after the frame
+// was handed over (right after the swap with vblank_after_swap), so the callback keeps running on
+// the interrupt thread with its own arguments. While the main loop hands over no frames (loading
+// screens), or with cutscene_clock_follows_frames off, the interrupt advances the clock itself
+// at the real 1/60 s boundaries, as before.
+//
+// The cameras could move smoothly at any frame rate only with a fractional clock: see
+// docs/DEVELOPMENT.md, "Frame pacing", for how to give sub_82432538 one.
+class EngineVblankClock {
+ public:
+  // The main loop handed over a frame.
+  void OnMainLoopFrame(Clock::time_point now) {
+    std::lock_guard lock(mutex_);
+    last_frame_ = now;
+    Advance(now, /*nearest=*/true);
+    pending_ -= kPhasePull * pending_;
+  }
+
+  // Called on each vblank interrupt: returns the number of engine vblanks to deliver now.
+  uint64_t Due(Clock::time_point now, bool follow_frames) {
+    std::lock_guard lock(mutex_);
+    if (!follow_frames || last_frame_ == Clock::time_point{} ||
+        now - last_frame_ > kFrameTimeout) {
+      Advance(now, /*nearest=*/false);
+    }
+    const uint64_t due = target_ - delivered_;
+    delivered_ = target_;
+    return due;
+  }
+
+ private:
+  // After this long without a frame the interrupt advances the clock on its own. It is longer
+  // than any frame the game shows outside loading screens.
+  static constexpr auto kFrameTimeout = std::chrono::milliseconds(100);
+  // Most steps given at once: after a longer stall (or time spent capped) the count skips ahead,
+  // as the game would see after a stall. Above kFrameTimeout, so frames down to 10 FPS lose none.
+  static constexpr double kMaxCatchUp = 8.0;
+  // Fraction of the carried part removed per frame; about 50 frames to settle on a new phase.
+  static constexpr double kPhasePull = 0.02;
+
+  void Advance(Clock::time_point now, bool nearest) {
+    if (last_ != Clock::time_point{}) {
+      pending_ += std::min(std::chrono::duration<double>(now - last_).count() * 60.0, kMaxCatchUp);
+    }
+    last_ = now;
+    // From frames, the nearest whole step (the carried part stays within half a step either
+    // way); from the interrupt, only whole 1/60 s that have passed. A part carried below zero
+    // from frames gives no step until it is made up.
+    const double steps = nearest ? std::floor(pending_ + 0.5) : std::floor(pending_);
+    if (steps > 0.0) {
+      pending_ -= steps;
+      target_ += uint64_t(steps);
+    }
+  }
+
+  std::mutex mutex_;
+  Clock::time_point last_;        // when the clock last advanced
+  Clock::time_point last_frame_;  // when the main loop last handed over a frame
+  double pending_ = 0.0;          // 1/60 s elapsed but not yet given as steps
+  uint64_t target_ = 0;           // steps given
+  uint64_t delivered_ = 0;        // steps delivered to the game by the interrupt
+};
+
+EngineVblankClock engine_vblank_clock;
+
+}  // namespace
+
 extern "C" void __imp__sub_8234BD00(PPCContext& __restrict ctx, uint8_t* base);
 extern "C" void sub_8234BD00(PPCContext& __restrict ctx, uint8_t* base) {
   if (!Uncapped()) {
     __imp__sub_8234BD00(ctx, base);
     return;
   }
-  static const Clock::time_point start = Clock::now();
-  static uint64_t counted = 0;
-  uint64_t real = uint64_t(std::chrono::duration<double>(Clock::now() - start).count() * 60.0);
-  if (real < counted) {
-    return;
-  }
-  // Catch up at most a few vblanks, as the game would see after a stall.
-  if (real - counted > 4) {
-    counted = real - 4;
-  }
-  for (; counted <= real; ++counted) {
+  const uint64_t due =
+      engine_vblank_clock.Due(Clock::now(), REXCVAR_GET(cutscene_clock_follows_frames));
+  for (uint64_t i = 0; i < due; ++i) {
     __imp__sub_8234BD00(ctx, base);
   }
 }
@@ -375,6 +462,9 @@ extern "C" void sub_824852F8(PPCContext& __restrict ctx, uint8_t* base) {
   const bool from_main_loop = uint32_t(ctx.lr) == kMainLoopHandOverCall;
   __imp__sub_824852F8(ctx, base);
   if (from_main_loop) {
+    if (Uncapped() && REXCVAR_GET(cutscene_clock_follows_frames)) {
+      engine_vblank_clock.OnMainLoopFrame(Clock::now());
+    }
     main_loop_engine_time.store(main_loop_engine_time.load(std::memory_order_relaxed) +
                                     LoadGuestFloat(base, kFrameDeltaAddress),
                                 std::memory_order_relaxed);

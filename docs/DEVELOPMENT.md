@@ -37,7 +37,8 @@ retire swaps quickly; at a real 60 Hz the game drops to 30 FPS every few seconds
 1000 Hz the cutscenes run many times too fast. `src/pg_frame_pacing.cpp` reconciles both:
 
 - the main loop interval and the swap interval are forced to 0 when uncapped;
-- the engine's vblank counter advances only once per real 1/60 s;
+- the engine's vblank counter advances at a real 60 Hz, in step with the main loop's frames
+  (see "Cutscene camera clock" below);
 - inside the swap, the vblank-count getter `sub_8234BE28` returns a private count that
   advances on every read, so the interval-2 waits end at once, while the cutscene cameras
   still read the real count;
@@ -49,6 +50,59 @@ retire swaps quickly; at a real 60 Hz the game drops to 30 FPS every few seconds
 `frame_rate_limit` then holds the game at a chosen rate with a high-resolution timer after
 each swap. 30 restores the original vsync pacing. `--uncapped_real_time=false` disables the
 fixes.
+
+### Cutscene camera clock
+
+The cutscene cameras only see whole vblanks, so their poses change at most 60 times a second.
+Uncapped, `sub_8234BD00` runs the original callback only when `EngineVblankClock` says a step is
+due. The steps are counted when the main loop hands over a frame (`sub_824852F8`): the 1/60 s
+elapsed since the last frame, rounded to whole steps. The part not given is carried to the next
+frame, and that carried part is pulled slowly toward zero, so the steps stay in phase with the
+frames even after the limiter restarts its schedule. The vblank interrupt still delivers the
+steps, within a millisecond, so the callback keeps its thread and arguments. While the main
+loop hands over no frames for 100 ms (loading screens), the interrupt advances the clock at the
+real 1/60 s boundaries itself.
+
+- At 60 FPS every frame sees exactly one step. Before, the steps fell at real 1/60 s boundaries
+  with no fixed phase to the frames, and frames near a boundary saw 0 or 2 steps (judder).
+- Above 60 FPS the steps are as evenly spaced as whole steps allow: at 120 FPS one every other
+  frame, and at 144 FPS gaps of 2 and 3 frames. Camera pans are still only 60 poses a second.
+- Cutscene speed stays within a few hundredths of a percent of real time (the pull trades that
+  much for a steady phase at some frame rates).
+- `--cutscene_clock_follows_frames=false` (hot reload) restores the free-running real-time
+  steps, to compare.
+- Capped (30 FPS, vsync) the hooks are not involved: every vblank runs the original callback.
+
+Fully smooth cameras above 60 FPS need fractional time in the camera itself. That needs the
+generated code (and the xex), which the fix above was made without:
+
+1. Find the counter. In `generated/`, open the body of `sub_8234BD00` and note the guest address
+   of the word it increments (a `lis`/`addi` pair or a constant in the `PPC_STORE_U32`). Check
+   that `sub_8234BE28` returns the same word.
+2. Find how `sub_82432538` reads it: a `bl sub_8234BE28`, or a load of that address. Follow the
+   value to the instruction that turns it into time: an integer-to-float conversion (`fcfid`,
+   often after a store and reload through the stack) followed by a multiply by 1/60 or a divide
+   by 60. Search the other callers of `sub_8234BE28` and the other loads of the address as well,
+   to know which other systems use the counter. Leave those on whole vblanks.
+3. Give the camera fractional vblanks there with a `[[midasm_hook]]` in `pg_config.toml`, at the
+   address of the conversion with `after_instruction = true` and `registers = ["fN"]` for the
+   register that holds the converted count. The generated code calls the named function with the
+   registers by reference (`PPCRegister&`), so declare it in a header listed in
+   `[entrypoint] includes` and define it in `src/`. While `Uncapped()`, replace the value with the
+   integer count plus the fraction of a step elapsed since the last step, from
+   `EngineVblankClock` (it knows when the last step was given and how much time is pending). Keep
+   the fraction below 1, so the camera never reads ahead of the next whole count. Regenerate
+   (`build.ps1` runs codegen when the config changes).
+4. If the camera does integer math on the count (segment lookups, `divw`, comparisons) before
+   any conversion, hook `sub_82432538` itself instead: run `__imp__sub_82432538` twice, with the
+   counter word set to the current count and to the next one, and interpolate the camera pose
+   it writes (find the output in the generated body: the object passed in `r3`, or a global
+   camera) by the elapsed fraction, then restore the counter word. Do this only when the second
+   run has no side effects (segment "ready" logging, triggers), otherwise interpolate between the
+   pose of the last step and that of the current one, one step behind.
+5. Test: a slow pan in a cutscene at 144 FPS should look as smooth as gameplay, a cutscene's
+   length (stopwatch, or the audio staying in sync) should not change, and at 30 FPS nothing
+   should change at all.
 
 ## Settings and flags
 
