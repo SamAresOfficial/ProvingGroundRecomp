@@ -1181,8 +1181,12 @@ Now the data is given to shared memory when it is first needed, and the address 
   (kept in order in the submission, `PrepareDeferredGpuWrite`), so a partial CPU write is
   right too.
 - A resolve of the same range replaces the tracked data without a write-back. A range not
-  resolved into for 600 frames is written back at the next direct resolve, so its texture can
-  be dropped; until then the texture is kept alive.
+  resolved into for 600 frames is written back at the first texture request of a frame
+  (whether or not another direct resolve comes), so its texture can be dropped; while a range
+  is tracked, its texture is never dropped as unused (`MustKeepUnusedTexture`).
+- Only a resolve of exactly the texture's size goes direct. For a texture smaller than the
+  8-aligned rectangle the usual resolve also writes EDRAM pixels past the texture, which the
+  texture could not give back, so that resolve is done the usual way.
 - `vulkan_readback_resolve`: a direct resolve is written back at once and read back like a
   usual one.
 - Safety net only: if a write-back cannot be done (no scratch buffer or descriptor), the range
